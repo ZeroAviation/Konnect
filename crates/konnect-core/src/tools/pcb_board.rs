@@ -17,8 +17,8 @@ use konnect_ipc::builders;
 use konnect_sexp::{
     parser::{parse_sexp, SexpNode},
     writer::{
-        apply_edits, find_block_with_leading_whitespace, find_direct_child_blocks, new_uuid,
-        write_atomic, SexpEdit,
+        apply_edits, find_block_starts, find_block_with_leading_whitespace,
+        find_direct_child_blocks, new_uuid, write_atomic, SexpEdit,
     },
 };
 use serde_json::json;
@@ -1528,8 +1528,10 @@ async fn handle_add_layer(
 
     let content = std::fs::read_to_string(&board_path)?;
 
-    // Find the (layers ...) block and insert before its closing paren
-    let layers_pos = match content.find("(layers") {
+    // Tag-aware, string-skipping search: `content.find("(layers")` matches the
+    // substring inside a quoted `"(layers"` on a gr_text / net name, and then
+    // the insert lands inside that graphic instead of the stackup table.
+    let layers_pos = match find_block_starts(&content, "layers").into_iter().next() {
         Some(p) => p,
         None => return Ok(CallToolResult::error("No (layers) section found")),
     };
@@ -2276,6 +2278,182 @@ mod layers_block_tests {
             .collect();
         assert!(used.contains(&1));
         assert_eq!((1..=30).find(|id| !used.contains(id)), Some(3));
+    }
+
+    fn board_with_gr_line_and_quoted_layers() -> String {
+        // A quoted "(layers" appears *before* the real stackup, plus a gr_line
+        // after it — the shape that used to eat the new layer into a graphic.
+        "(kicad_pcb\n\
+         \t(version 20250610)\n\
+         \t(generator \"pcbnew\")\n\
+         \t(generator_version \"10.0\")\n\
+         \t(general\n\t\t(thickness 1.6)\n\t)\n\
+         \t(paper \"A4\")\n\
+         \t(gr_text \"(layers\"\n\
+         \t\t(at 5 5 0)\n\
+         \t\t(layer \"Dwgs.User\")\n\
+         \t\t(uuid \"aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee\")\n\
+         \t\t(effects\n\t\t\t(font\n\t\t\t\t(size 1.27 1.27)\n\t\t\t)\n\t\t)\n\
+         \t)\n\
+         \t(layers\n\
+         \t\t(0 \"F.Cu\" signal)\n\
+         \t\t(2 \"B.Cu\" signal)\n\
+         \t\t(1 \"F.Mask\" user)\n\
+         \t\t(3 \"B.Mask\" user)\n\
+         \t\t(25 \"Edge.Cuts\" user)\n\
+         \t)\n\
+         \t(setup\n\t\t(pad_to_mask_clearance 0.05)\n\t)\n\
+         \t(net 0 \"\")\n\
+         \t(gr_line\n\
+         \t\t(start 0 0)\n\
+         \t\t(end 10 0)\n\
+         \t\t(stroke\n\t\t\t(width 0.05)\n\t\t\t(type default)\n\t\t)\n\
+         \t\t(layer \"Edge.Cuts\")\n\
+         \t\t(uuid \"bbbbbbbb-bbbb-cccc-dddd-eeeeeeeeeeee\")\n\
+         \t)\n\
+         )\n"
+        .to_string()
+    }
+
+    fn copper_names(board: &str) -> Vec<String> {
+        let tree = parse_sexp(board).unwrap();
+        konnect_sexp::layers::copper(&konnect_sexp::layers::layers(&tree))
+            .into_iter()
+            .map(|l| l.name.clone())
+            .collect()
+    }
+
+    fn layer_is_inside_a_graphic(board: &str, needle: &str) -> bool {
+        for tag in ["gr_line", "gr_text", "gr_rect", "gr_arc"] {
+            for start in find_block_starts(board, tag) {
+                let Some((_, end)) = konnect_sexp::writer::find_balanced_block(board, start) else {
+                    continue;
+                };
+                if board[start..end].contains(needle) && tag != "gr_text" {
+                    return true;
+                }
+                // A gr_text decoy may *contain* the substring "(layers"; the
+                // new layer entry `(N "In1.Cu"` must still not appear there.
+                if tag == "gr_text" && board[start..end].contains(r#""In1.Cu""#) {
+                    return true;
+                }
+            }
+        }
+        false
+    }
+
+    fn try_kicad_cli_accepts(board: &std::path::Path) {
+        let Some(cli) = crate::kicad_install::find_cli("") else {
+            return;
+        };
+        let tmp = tempfile::tempdir().unwrap();
+        let upgraded = tmp.path().join("upgraded.kicad_pcb");
+        std::fs::copy(board, &upgraded).unwrap();
+        let status = std::process::Command::new(&cli)
+            .args(["pcb", "upgrade", "--force"])
+            .arg(&upgraded)
+            .status()
+            .expect("spawn kicad-cli");
+        assert!(
+            status.success(),
+            "kicad-cli pcb upgrade refused {}",
+            board.display()
+        );
+    }
+
+    #[tokio::test]
+    async fn add_layer_inserts_a_sibling_even_when_gr_line_and_quoted_layers_are_present() {
+        let dir = tempfile::tempdir().unwrap();
+        let board = dir.path().join("board.kicad_pcb");
+        std::fs::write(&board, board_with_gr_line_and_quoted_layers()).unwrap();
+        let ctx = super::board_mock::ctx_talking_to(String::new());
+
+        let first = handle_add_layer(
+            &json!({
+                "board": board,
+                "layer_name": "In1.Cu",
+                "layer_type": "power"
+            }),
+            &ctx,
+        )
+        .await
+        .unwrap();
+        assert!(!first.is_error, "{first:?}");
+        let second = handle_add_layer(
+            &json!({
+                "board": board,
+                "layer_name": "In2.Cu",
+                "layer_type": "power"
+            }),
+            &ctx,
+        )
+        .await
+        .unwrap();
+        assert!(!second.is_error, "{second:?}");
+
+        let written = std::fs::read_to_string(&board).unwrap();
+        let names = copper_names(&written);
+        assert!(
+            names.contains(&"F.Cu".to_string())
+                && names.contains(&"B.Cu".to_string())
+                && names.contains(&"In1.Cu".to_string())
+                && names.contains(&"In2.Cu".to_string()),
+            "expected a 4-layer copper stack, got {names:?}"
+        );
+        assert_eq!(names.len(), 4, "copper stack {names:?}");
+        assert!(
+            !layer_is_inside_a_graphic(&written, r#""In1.Cu""#),
+            "In1.Cu was written inside a graphic:\n{written}"
+        );
+        assert!(
+            !layer_is_inside_a_graphic(&written, r#""In2.Cu""#),
+            "In2.Cu was written inside a graphic:\n{written}"
+        );
+        let tree = parse_sexp(&written).unwrap();
+        let stack = konnect_sexp::layers::layers(&tree);
+        assert!(
+            stack
+                .iter()
+                .any(|l| l.name == "In1.Cu" && l.kind == "power"),
+            "{stack:?}"
+        );
+        try_kicad_cli_accepts(&board);
+    }
+
+    #[tokio::test]
+    async fn add_layer_on_a_real_kicad10_board_with_gr_line_keeps_the_file_parseable() {
+        let src = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../konnect-sexp/tests/fixtures/placement/placement_fixture.kicad_pcb");
+        let dir = tempfile::tempdir().unwrap();
+        let board = dir.path().join("board.kicad_pcb");
+        std::fs::copy(&src, &board).unwrap();
+        let ctx = super::board_mock::ctx_talking_to(String::new());
+
+        let result = handle_add_layer(
+            &json!({
+                "board": board,
+                "layer_name": "In1.Cu",
+                "layer_type": "power"
+            }),
+            &ctx,
+        )
+        .await
+        .unwrap();
+        assert!(!result.is_error, "{result:?}");
+
+        let written = std::fs::read_to_string(&board).unwrap();
+        assert!(
+            written.contains("(gr_line"),
+            "fixture lost its Edge.Cuts gr_line"
+        );
+        assert!(
+            !layer_is_inside_a_graphic(&written, r#""In1.Cu""#),
+            "In1.Cu was written inside a graphic"
+        );
+        let names = copper_names(&written);
+        assert!(names.contains(&"In1.Cu".to_string()), "{names:?}");
+        parse_sexp(&written).expect("board still parses");
+        try_kicad_cli_accepts(&board);
     }
 }
 
