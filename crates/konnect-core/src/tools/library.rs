@@ -6,7 +6,9 @@
 use crate::mcp::error::ToolErrorKind;
 use crate::mcp::protocol::CallToolResult;
 use crate::tool;
-use crate::tools::{get_path, require_array, require_str, ToolContext, ToolDef};
+use crate::tools::{
+    get_path, opt_f64, opt_str, require_array, require_f64, require_str, ToolContext, ToolDef,
+};
 use konnect_schematic_editor::types::fmt_f64;
 use konnect_sexp::parser::{parse_sexp, SexpNode};
 use konnect_sexp::writer::{
@@ -260,6 +262,76 @@ pub fn tools() -> Vec<ToolDef> {
                 "required": ["library_path", "symbol_name"]
             }),
             |args, ctx| async move { handle_delete_symbol(args, ctx).await }
+        ),
+        tool!(
+            "set_symbol_pin",
+            "Edit one pin on an existing library symbol: name, electrical type, \
+             position, angle, or length. Changing coordinates or length is a pin \
+             move — wires attach at pin positions — so it is refused unless \
+             allow_pin_moves is true. A rename or type change leaves pins_moved empty.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "library_path": { "type": "string", "description": "Path to .kicad_sym library file" },
+                    "symbol_name": { "type": "string", "description": "Top-level symbol name" },
+                    "number": { "type": "string", "description": "Pin number, e.g. '2'" },
+                    "name": { "type": "string", "description": "New pin name. Omit to leave it." },
+                    "type": {
+                        "type": "string",
+                        "enum": ["input", "output", "bidirectional", "tri_state", "passive", "free", "unspecified", "power_in", "power_out", "open_collector", "open_emitter", "no_connect"],
+                        "description": "New electrical type. Omit to leave it."
+                    },
+                    "x": { "type": "number", "description": "New pin X in symbol space. Omit to leave it." },
+                    "y": { "type": "number", "description": "New pin Y in symbol space. Omit to leave it." },
+                    "angle": { "type": "number", "description": "New pin angle in degrees. Omit to leave it." },
+                    "length": { "type": "number", "description": "New pin length in mm. Omit to leave it." },
+                    "allow_pin_moves": {
+                        "type": "boolean",
+                        "default": false,
+                        "description": "Permit changing pin coordinates or length. Wires and labels attached at the old pin positions are NOT moved."
+                    }
+                },
+                "required": ["library_path", "symbol_name", "number"]
+            }),
+            |args, ctx| async move { handle_set_symbol_pin(args, ctx).await }
+        ),
+        tool!(
+            "set_symbol_body",
+            "Set the body rectangle of an existing library symbol (start/end in symbol \
+             space). Does not move pins. Use this to widen a box that pin names overrun.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "library_path": { "type": "string", "description": "Path to .kicad_sym library file" },
+                    "symbol_name": { "type": "string", "description": "Top-level symbol name" },
+                    "x1": { "type": "number", "description": "Rectangle start X" },
+                    "y1": { "type": "number", "description": "Rectangle start Y" },
+                    "x2": { "type": "number", "description": "Rectangle end X" },
+                    "y2": { "type": "number", "description": "Rectangle end Y" },
+                    "unit": {
+                        "type": "integer",
+                        "description": "Unit to edit (1-based). Omit to edit the first rectangle in the symbol."
+                    }
+                },
+                "required": ["library_path", "symbol_name", "x1", "y1", "x2", "y2"]
+            }),
+            |args, ctx| async move { handle_set_symbol_body(args, ctx).await }
+        ),
+        tool!(
+            "set_symbol_property",
+            "Set a property default on an existing library symbol (Reference, Value, \
+             Footprint, Datasheet, Description, or a custom field). Does not move pins.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "library_path": { "type": "string", "description": "Path to .kicad_sym library file" },
+                    "symbol_name": { "type": "string", "description": "Top-level symbol name" },
+                    "field": { "type": "string", "description": "Property name" },
+                    "value": { "type": "string", "description": "New property value" }
+                },
+                "required": ["library_path", "symbol_name", "field", "value"]
+            }),
+            |args, ctx| async move { handle_set_symbol_property(args, ctx).await }
         ),
         tool!(
             "list_symbols_in_library",
@@ -3600,6 +3672,416 @@ async fn handle_delete_symbol(
     ))
 }
 
+const PIN_ELECTRICAL_TYPES: &[&str] = &[
+    "input",
+    "output",
+    "bidirectional",
+    "tri_state",
+    "passive",
+    "free",
+    "unspecified",
+    "power_in",
+    "power_out",
+    "open_collector",
+    "open_emitter",
+    "no_connect",
+];
+
+fn top_level_symbol_span(content: &str, name: &str) -> Option<(usize, usize)> {
+    let needle = format!("(symbol \"{name}\"");
+    for (start, end) in find_direct_child_blocks(content, "kicad_symbol_lib") {
+        let block = content[start..end].trim_start();
+        if block.starts_with(&needle) {
+            let after = block.as_bytes().get(needle.len()).copied();
+            if matches!(
+                after,
+                None | Some(b' ')
+                    | Some(b'\t')
+                    | Some(b'\n')
+                    | Some(b'\r')
+                    | Some(b'(')
+                    | Some(b')')
+            ) {
+                return Some((start, end));
+            }
+        }
+    }
+    None
+}
+
+fn quoted_field_value_span(block: &str, tag: &str) -> Option<(usize, usize)> {
+    let needle = format!("({tag} \"");
+    let rel = block.find(&needle)?;
+    let value_start = rel + needle.len();
+    let value_end = closing_library_quote(block, value_start)?;
+    Some((value_start, value_end))
+}
+
+fn closing_library_quote(block: &str, value_start: usize) -> Option<usize> {
+    let mut escaped = false;
+    for (offset, ch) in block[value_start..].char_indices() {
+        if escaped {
+            escaped = false;
+        } else if ch == '\\' {
+            escaped = true;
+        } else if ch == '"' {
+            return Some(value_start + offset);
+        }
+    }
+    None
+}
+
+fn pin_block_for_number(
+    content: &str,
+    symbol: (usize, usize),
+    number: &str,
+) -> Option<(usize, usize)> {
+    let body = &content[symbol.0..symbol.1];
+    for rel in find_block_starts(body, "pin") {
+        let Some((_, rel_end)) = find_balanced_block(body, rel) else {
+            continue;
+        };
+        let pin = &body[rel..rel_end];
+        let Some((vs, ve)) = quoted_field_value_span(pin, "number") else {
+            continue;
+        };
+        if &pin[vs..ve] == number {
+            return Some((symbol.0 + rel, symbol.0 + rel_end));
+        }
+    }
+    None
+}
+
+fn pin_at_and_length(pin_block: &str) -> Option<((f64, f64, f64), f64)> {
+    let tree = parse_sexp(pin_block).ok()?;
+    let (x, y, rot) = konnect_sexp::schematic::parse_at(&tree)?;
+    let length = tree.find("length")?.get_f64(1)?;
+    Some(((x, y, rot), length))
+}
+
+fn replace_pin_token(
+    pin_block: &str,
+    file_start: usize,
+    which: usize,
+    value: &str,
+) -> Option<SexpEdit> {
+    // `(pin TYPE STYLE …)` — tokens 1 and 2 after the opening `(pin`.
+    let after_pin = pin_block.find("(pin ")? + "(pin ".len();
+    let rest = &pin_block[after_pin..];
+    let mut start = after_pin;
+    for token in 0..which {
+        let skip = rest[start - after_pin..]
+            .find(|c: char| c.is_ascii_whitespace())
+            .map(|i| start - after_pin + i)?;
+        let next = rest[skip..]
+            .find(|c: char| !c.is_ascii_whitespace())
+            .map(|i| after_pin + skip + i)?;
+        let _ = token;
+        start = next;
+    }
+    let len = pin_block[start..]
+        .find(|c: char| c.is_ascii_whitespace() || c == '(')
+        .unwrap_or(pin_block.len() - start);
+    Some(SexpEdit::replace(
+        file_start + start,
+        file_start + start + len,
+        value.to_string(),
+    ))
+}
+
+async fn handle_set_symbol_pin(
+    args: &serde_json::Value,
+    _ctx: &ToolContext,
+) -> anyhow::Result<CallToolResult> {
+    let lib_path = get_path(args, "library_path")?;
+    let symbol_name = match require_str(args, "symbol_name") {
+        Ok(v) => v.to_string(),
+        Err(e) => return Ok(e),
+    };
+    let number = match require_str(args, "number") {
+        Ok(v) => v.to_string(),
+        Err(e) => return Ok(e),
+    };
+    let allow_pin_moves = args["allow_pin_moves"].as_bool().unwrap_or(false);
+    let content = read_consistent(&lib_path)?;
+    let Some(symbol) = top_level_symbol_span(&content, &symbol_name) else {
+        return Ok(CallToolResult::error(format!(
+            "Symbol '{symbol_name}' not found in library"
+        )));
+    };
+    let Some(pin_span) = pin_block_for_number(&content, symbol, &number) else {
+        return Ok(CallToolResult::error(format!(
+            "pin '{number}' not found on symbol '{symbol_name}'"
+        )));
+    };
+    let pin_block = content[pin_span.0..pin_span.1].to_string();
+    let Some(((old_x, old_y, old_rot), old_len)) = pin_at_and_length(&pin_block) else {
+        return Ok(CallToolResult::error(format!(
+            "pin '{number}' on '{symbol_name}' has no readable (at)/(length)"
+        )));
+    };
+
+    let new_x = opt_f64(args, "x").unwrap_or(old_x);
+    let new_y = opt_f64(args, "y").unwrap_or(old_y);
+    let new_rot = opt_f64(args, "angle").unwrap_or(old_rot);
+    let new_len = opt_f64(args, "length").unwrap_or(old_len);
+    let geometry_changed = (new_x - old_x).abs() > 1e-9
+        || (new_y - old_y).abs() > 1e-9
+        || (new_rot - old_rot).abs() > 1e-9
+        || (new_len - old_len).abs() > 1e-9;
+    if geometry_changed && !allow_pin_moves {
+        return Ok(CallToolResult::error(format!(
+            "pin '{number}' on '{symbol_name}' would move (from ({old_x}, {old_y}) \
+             length {old_len} to ({new_x}, {new_y}) length {new_len}). Wires and \
+             labels attach at pin coordinates. Pass allow_pin_moves: true to \
+             change them anyway, then reconnect."
+        )));
+    }
+
+    let mut edits = Vec::new();
+    if let Some(name) = opt_str(args, "name") {
+        let Some((vs, ve)) = quoted_field_value_span(&pin_block, "name") else {
+            return Ok(CallToolResult::error(format!(
+                "pin '{number}' has no (name …) to edit"
+            )));
+        };
+        edits.push(SexpEdit::replace(
+            pin_span.0 + vs,
+            pin_span.0 + ve,
+            name.to_string(),
+        ));
+    }
+    if let Some(pin_type) = opt_str(args, "type") {
+        if !PIN_ELECTRICAL_TYPES.contains(&pin_type) {
+            return Ok(CallToolResult::error(format!(
+                "unknown pin electrical type '{pin_type}'"
+            )));
+        }
+        let Some(edit) = replace_pin_token(&pin_block, pin_span.0, 0, pin_type) else {
+            return Ok(CallToolResult::error(format!(
+                "pin '{number}' has no electrical type token to edit"
+            )));
+        };
+        edits.push(edit);
+    }
+    if geometry_changed {
+        let Some(at_rel) = pin_block.find("(at ") else {
+            return Ok(CallToolResult::error(format!(
+                "pin '{number}' has no (at …) to edit"
+            )));
+        };
+        let at_end = pin_block[at_rel..]
+            .find(')')
+            .map(|i| at_rel + i + 1)
+            .unwrap();
+        edits.push(SexpEdit::replace(
+            pin_span.0 + at_rel,
+            pin_span.0 + at_end,
+            format!(
+                "(at {} {} {})",
+                fmt_f64(new_x),
+                fmt_f64(new_y),
+                fmt_f64(new_rot)
+            ),
+        ));
+        if let Some(len_rel) = pin_block.find("(length ") {
+            let len_end = pin_block[len_rel..]
+                .find(')')
+                .map(|i| len_rel + i + 1)
+                .unwrap();
+            edits.push(SexpEdit::replace(
+                pin_span.0 + len_rel,
+                pin_span.0 + len_end,
+                format!("(length {})", fmt_f64(new_len)),
+            ));
+        }
+    }
+
+    if edits.is_empty() {
+        return Ok(CallToolResult::json(&json!({
+            "symbol": symbol_name,
+            "number": number,
+            "changed": [],
+            "pins_moved": []
+        })));
+    }
+
+    let new_content = apply_edits(content.clone(), edits);
+    write_atomic_if_unchanged(&lib_path, &content, &new_content)?;
+    let mut changed = Vec::new();
+    if opt_str(args, "name").is_some() {
+        changed.push("name");
+    }
+    if opt_str(args, "type").is_some() {
+        changed.push("type");
+    }
+    if geometry_changed {
+        changed.push("geometry");
+    }
+    Ok(CallToolResult::json(&json!({
+        "symbol": symbol_name,
+        "number": number,
+        "changed": changed,
+        "pins_moved": if geometry_changed {
+            json!([format!("{symbol_name}.{number}")])
+        } else {
+            json!([])
+        }
+    })))
+}
+
+fn first_rectangle_in_unit(
+    content: &str,
+    symbol: (usize, usize),
+    unit: Option<u32>,
+) -> Option<(usize, usize)> {
+    let body = &content[symbol.0..symbol.1];
+    if let Some(unit) = unit {
+        let name_end = body.find('"')?;
+        let name_close = body[name_end + 1..].find('"')?;
+        let name = &body[name_end + 1..name_end + 1 + name_close];
+        let unit_tag = format!("(symbol \"{name}_{unit}_1\"");
+        let rel = body.find(&unit_tag)?;
+        let (_, unit_end) = find_balanced_block(body, rel)?;
+        let unit_body = &body[rel..unit_end];
+        let rect_rel = find_block_starts(unit_body, "rectangle")
+            .into_iter()
+            .next()?;
+        let (_, rect_end) = find_balanced_block(unit_body, rect_rel)?;
+        return Some((symbol.0 + rel + rect_rel, symbol.0 + rel + rect_end));
+    }
+    let rect_rel = find_block_starts(body, "rectangle").into_iter().next()?;
+    let (_, rect_end) = find_balanced_block(body, rect_rel)?;
+    Some((symbol.0 + rect_rel, symbol.0 + rect_end))
+}
+
+async fn handle_set_symbol_body(
+    args: &serde_json::Value,
+    _ctx: &ToolContext,
+) -> anyhow::Result<CallToolResult> {
+    let lib_path = get_path(args, "library_path")?;
+    let symbol_name = match require_str(args, "symbol_name") {
+        Ok(v) => v.to_string(),
+        Err(e) => return Ok(e),
+    };
+    let x1 = match require_f64(args, "x1") {
+        Ok(v) => v,
+        Err(e) => return Ok(e),
+    };
+    let y1 = match require_f64(args, "y1") {
+        Ok(v) => v,
+        Err(e) => return Ok(e),
+    };
+    let x2 = match require_f64(args, "x2") {
+        Ok(v) => v,
+        Err(e) => return Ok(e),
+    };
+    let y2 = match require_f64(args, "y2") {
+        Ok(v) => v,
+        Err(e) => return Ok(e),
+    };
+    let unit = opt_f64(args, "unit").map(|u| u as u32);
+    let content = read_consistent(&lib_path)?;
+    let Some(symbol) = top_level_symbol_span(&content, &symbol_name) else {
+        return Ok(CallToolResult::error(format!(
+            "Symbol '{symbol_name}' not found in library"
+        )));
+    };
+    let Some(rect) = first_rectangle_in_unit(&content, symbol, unit) else {
+        return Ok(CallToolResult::error(format!(
+            "symbol '{symbol_name}' has no body rectangle to edit"
+        )));
+    };
+    let block = &content[rect.0..rect.1];
+    let Some(start_rel) = block.find("(start ") else {
+        return Ok(CallToolResult::error(
+            "body rectangle has no (start …)".to_string(),
+        ));
+    };
+    let start_end = block[start_rel..]
+        .find(')')
+        .map(|i| start_rel + i + 1)
+        .unwrap();
+    let Some(end_rel) = block.find("(end ") else {
+        return Ok(CallToolResult::error(
+            "body rectangle has no (end …)".to_string(),
+        ));
+    };
+    let end_end = block[end_rel..].find(')').map(|i| end_rel + i + 1).unwrap();
+    let edits = vec![
+        SexpEdit::replace(
+            rect.0 + start_rel,
+            rect.0 + start_end,
+            format!("(start {} {})", fmt_f64(x1), fmt_f64(y1)),
+        ),
+        SexpEdit::replace(
+            rect.0 + end_rel,
+            rect.0 + end_end,
+            format!("(end {} {})", fmt_f64(x2), fmt_f64(y2)),
+        ),
+    ];
+    let new_content = apply_edits(content.clone(), edits);
+    write_atomic_if_unchanged(&lib_path, &content, &new_content)?;
+    Ok(CallToolResult::json(&json!({
+        "symbol": symbol_name,
+        "body": {"x1": x1, "y1": y1, "x2": x2, "y2": y2},
+        "pins_moved": []
+    })))
+}
+
+async fn handle_set_symbol_property(
+    args: &serde_json::Value,
+    _ctx: &ToolContext,
+) -> anyhow::Result<CallToolResult> {
+    let lib_path = get_path(args, "library_path")?;
+    let symbol_name = match require_str(args, "symbol_name") {
+        Ok(v) => v.to_string(),
+        Err(e) => return Ok(e),
+    };
+    let field = match require_str(args, "field") {
+        Ok(v) => v.to_string(),
+        Err(e) => return Ok(e),
+    };
+    let value = match require_str(args, "value") {
+        Ok(v) => v.to_string(),
+        Err(e) => return Ok(e),
+    };
+    let content = read_consistent(&lib_path)?;
+    let Some(symbol) = top_level_symbol_span(&content, &symbol_name) else {
+        return Ok(CallToolResult::error(format!(
+            "Symbol '{symbol_name}' not found in library"
+        )));
+    };
+    let block = &content[symbol.0..symbol.1];
+    let needle = format!("(property \"{field}\" \"");
+    let Some(rel) = block.find(&needle) else {
+        return Ok(CallToolResult::error(format!(
+            "property '{field}' not found on symbol '{symbol_name}'"
+        )));
+    };
+    let value_start = rel + needle.len();
+    let Some(value_end) = closing_library_quote(block, value_start) else {
+        return Ok(CallToolResult::error(format!(
+            "property '{field}' on '{symbol_name}' is malformed"
+        )));
+    };
+    let new_content = apply_edits(
+        content.clone(),
+        vec![SexpEdit::replace(
+            symbol.0 + value_start,
+            symbol.0 + value_end,
+            value.clone(),
+        )],
+    );
+    write_atomic_if_unchanged(&lib_path, &content, &new_content)?;
+    Ok(CallToolResult::json(&json!({
+        "symbol": symbol_name,
+        "field": field,
+        "value": value,
+        "pins_moved": []
+    })))
+}
+
 /// Extract the names of every top-level symbol defined in a `.kicad_sym`
 /// library body, sorted and de-duplicated.
 ///
@@ -5586,6 +6068,173 @@ mod tests {
                 "pin at {px} (angle {angle}) roots at {root}, body edge is {edge}"
             );
         }
+    }
+
+    async fn shunt_lib() -> (tempfile::TempDir, std::path::PathBuf) {
+        let tmp = tempfile::tempdir().unwrap();
+        let lib = tmp.path().join("shunt.kicad_sym");
+        let result = handle_create_symbol(
+            &json!({
+                "library_path": lib.to_string_lossy(),
+                "name": "TL432",
+                "reference_prefix": "U",
+                "pins": [
+                    {"number":"1","name":"REF","type":"input","x":-7.62,"y":0.0,"angle":0,"length":2.54},
+                    {"number":"2","name":"CATHODE","type":"passive","x":7.62,"y":2.54,"angle":180,"length":2.54},
+                    {"number":"3","name":"ANODE","type":"passive","x":7.62,"y":-2.54,"angle":180,"length":2.54}
+                ]
+            }),
+            &test_ctx(),
+        )
+        .await
+        .unwrap();
+        assert!(!result.is_error, "{:?}", result.content);
+        (tmp, lib)
+    }
+
+    fn pin_named(lib: &std::path::Path, number: &str) -> String {
+        let tree = konnect_sexp::parse_sexp(&std::fs::read_to_string(lib).unwrap()).unwrap();
+        let unit = tree.find("symbol").unwrap().find("symbol").unwrap();
+        for pin in unit.find_all("pin") {
+            if pin.find("number").and_then(|n| n.get(1)?.as_str()) == Some(number) {
+                return pin
+                    .find("name")
+                    .and_then(|n| n.get(1)?.as_str())
+                    .unwrap_or("")
+                    .to_string();
+            }
+        }
+        String::new()
+    }
+
+    fn pin_at(lib: &std::path::Path, number: &str) -> (f64, f64, f64) {
+        let tree = konnect_sexp::parse_sexp(&std::fs::read_to_string(lib).unwrap()).unwrap();
+        let unit = tree.find("symbol").unwrap().find("symbol").unwrap();
+        let pin = unit
+            .find_all("pin")
+            .into_iter()
+            .find(|pin| pin.find("number").and_then(|n| n.get(1)?.as_str()) == Some(number))
+            .unwrap();
+        konnect_sexp::schematic::parse_at(pin).unwrap()
+    }
+
+    #[tokio::test]
+    async fn set_symbol_pin_renames_without_moving() {
+        let (_tmp, lib) = shunt_lib().await;
+        let before_at = pin_at(&lib, "2");
+        let result = handle_set_symbol_pin(
+            &json!({
+                "library_path": lib.to_string_lossy(),
+                "symbol_name": "TL432",
+                "number": "2",
+                "name": "K"
+            }),
+            &test_ctx(),
+        )
+        .await
+        .unwrap();
+        assert!(!result.is_error, "{:?}", result.content);
+        let crate::mcp::protocol::ToolContent::Text { text } = &result.content[0] else {
+            panic!("expected text")
+        };
+        let body: serde_json::Value = serde_json::from_str(text).unwrap();
+        assert_eq!(body["pins_moved"], json!([]));
+        assert_eq!(pin_named(&lib, "2"), "K");
+        assert_eq!(pin_at(&lib, "2"), before_at);
+    }
+
+    #[tokio::test]
+    async fn set_symbol_pin_refuses_a_move_without_opt_in() {
+        let (_tmp, lib) = shunt_lib().await;
+        let before = std::fs::read_to_string(&lib).unwrap();
+        let result = handle_set_symbol_pin(
+            &json!({
+                "library_path": lib.to_string_lossy(),
+                "symbol_name": "TL432",
+                "number": "2",
+                "x": 12.7,
+                "y": 2.54
+            }),
+            &test_ctx(),
+        )
+        .await
+        .unwrap();
+        assert!(result.is_error, "{:?}", result.content);
+        let msg = format!("{:?}", result.content);
+        assert!(msg.contains("allow_pin_moves"), "{msg}");
+        assert_eq!(std::fs::read_to_string(&lib).unwrap(), before);
+    }
+
+    #[tokio::test]
+    async fn set_symbol_body_widens_the_rectangle_and_leaves_pins() {
+        let (_tmp, lib) = shunt_lib().await;
+        let before_tree =
+            konnect_sexp::parse_sexp(&std::fs::read_to_string(&lib).unwrap()).unwrap();
+        let before_pin = konnect_sexp::schematic::parse_at(
+            before_tree
+                .find("symbol")
+                .unwrap()
+                .find("symbol")
+                .unwrap()
+                .find("pin")
+                .unwrap(),
+        )
+        .unwrap();
+        let result = handle_set_symbol_body(
+            &json!({
+                "library_path": lib.to_string_lossy(),
+                "symbol_name": "TL432",
+                "x1": -8.89,
+                "y1": -5.08,
+                "x2": 8.89,
+                "y2": 5.08
+            }),
+            &test_ctx(),
+        )
+        .await
+        .unwrap();
+        assert!(!result.is_error, "{:?}", result.content);
+        let tree = konnect_sexp::parse_sexp(&std::fs::read_to_string(&lib).unwrap()).unwrap();
+        let rect = tree
+            .find("symbol")
+            .unwrap()
+            .find("symbol")
+            .unwrap()
+            .find("rectangle")
+            .unwrap();
+        let (sx, sy) = konnect_sexp::schematic::parse_start(rect).unwrap();
+        let (ex, ey) = konnect_sexp::schematic::parse_end(rect).unwrap();
+        assert!((sx + 8.89).abs() < 1e-6 && (sy + 5.08).abs() < 1e-6);
+        assert!((ex - 8.89).abs() < 1e-6 && (ey - 5.08).abs() < 1e-6);
+        let after_pin = konnect_sexp::schematic::parse_at(
+            tree.find("symbol")
+                .unwrap()
+                .find("symbol")
+                .unwrap()
+                .find("pin")
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(before_pin, after_pin);
+    }
+
+    #[tokio::test]
+    async fn set_symbol_property_updates_the_default_value() {
+        let (_tmp, lib) = shunt_lib().await;
+        let result = handle_set_symbol_property(
+            &json!({
+                "library_path": lib.to_string_lossy(),
+                "symbol_name": "TL432",
+                "field": "Value",
+                "value": "TL431"
+            }),
+            &test_ctx(),
+        )
+        .await
+        .unwrap();
+        assert!(!result.is_error, "{:?}", result.content);
+        let out = std::fs::read_to_string(&lib).unwrap();
+        assert!(out.contains("(property \"Value\" \"TL431\""), "{out}");
     }
 
     #[test]
