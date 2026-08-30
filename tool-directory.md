@@ -13,7 +13,7 @@ Compatibility notes for removed or narrowed arguments are recorded in
 ## Overview
 
 - **20 toolsets** organized into 10 categories
-- **221 registered tools** + **7 always-visible meta-tools** = **228 total**
+- **224 registered tools** + **7 always-visible meta-tools** = **231 total**
 - **Discovery pattern**: the server pre-loads only the **starter kit** (`project`, `config`) so baseline `tools/list` costs ~2K tokens instead of ~23K. The LLM reads `list_toolboxes` → calls `load_toolset(name)` to expose additional tools on demand; `unload_toolset(name)` prunes them. `tools/list_changed` is notified on every mutation. If the LLM calls a tool whose toolset isn't loaded, the error names the owning toolset so recovery is a single `load_toolset` hop. `load_toolset` also accepts an array of names to load several toolsets with a single `tools/list` refresh.
 - **Observability**: every `tools/call` is recorded — ring buffer of the last 100 calls + per-tool counters + JSONL at `<konnect dir>/logs/calls.jsonl`. The LLM self-diagnoses via `get_recent_calls` and `server_stats`.
 
@@ -152,7 +152,7 @@ Seven tools, grouped into *discovery/routing*, *observability*, and *runtime dia
 | `get_connected_items` | Get all wires, labels, and components connected to a given component by tracing each of its pins. |
 | `check_schematic_overlaps` | Find collisions using transformed symbol drawings and pins (excluding free text), with a reported origin fallback when geometry is unavailable. |
 
-### `sch_batch` · 12 tools
+### `sch_batch` · 15 tools
 **Purpose:** Bulk add, edit, delete, and move schematic elements in one call.
 **Source:** [`crates/konnect-core/src/tools/sch_batch.rs`](crates/konnect-core/src/tools/sch_batch.rs)
 
@@ -162,6 +162,9 @@ Seven tools, grouped into *discovery/routing*, *observability*, and *runtime dia
 | `batch_delete` | Delete multiple schematic items (wires, labels, junctions, components) by UUID or reference — single file write. |
 | `bulk_move_schematic_components` | Move multiple components by a uniform dx/dy offset in a single atomic write. |
 | `batch_edit_schematic_components` | Apply field updates (Value, Footprint, custom properties) to multiple components in a single atomic write. |
+| `set_schematic_field_position` | Move one property on a placed symbol (Reference, Value, or a custom field) to an absolute sheet coordinate, with optional rotation and justify. |
+| `autoplace_schematic_fields` | Move unhidden fields struck by a wire or component lead to the nearest clear 1.27 mm grid point, using the field's effective (composed) angle. |
+| `batch_set_schematic_field_positions` | Move many schematic fields in one load/write. Each entry is a set_schematic_field_position argument object. |
 | `batch_delete_schematic_components` | Delete multiple components by reference designator in a single atomic write. |
 | `connect_passthrough` | Add a wire stub and matching net label at a point to route a signal through a region without drawing a full path. Direction defaults to `auto`. |
 | `add_schematic_text` | Add a text annotation (non-net label) to the schematic at a given position. Aligns the text against that position with `justify`, per axis and defaulting to `left bottom` as KiCad does; an omitted axis is centred, and `center` centres both. Takes `bold`, `italic`, `thickness` and `color` for the font. |
@@ -377,7 +380,7 @@ the router or relying on the KiCad ActionPlugin workflow.
 | Tool | Description |
 |------|-------------|
 | `run_drc` | Run KiCad's complete configured DRC ruleset and return structured violation results. |
-| `set_design_rules` | Set board-level design rules (clearance, trace width, via size) in the sibling `.kicad_pro` project file. The board file is not modified. |
+| `set_design_rules` | Set board-level DRC minima in the sibling `.kicad_pro` (`board.design_settings.rules`). Never writes the board file — KiCad 10 rejects those tokens in `(setup)` and will not open it. Distinct from `add_design_rule`. |
 | `get_design_rules` | Return the current design rule constraints from the sibling `.kicad_pro` project file. |
 | `set_predefined_sizes` | Write the PCB editor Pre-defined Sizes list (track widths and via pad/drill pairs) into the sibling `.kicad_pro`. These fill the Track/Via dropdowns; they are not DRC limits. |
 | `get_predefined_sizes` | Return the Pre-defined Sizes list from the sibling `.kicad_pro`, including the 0 / 0,0 netclass sentinel. |
@@ -402,7 +405,7 @@ the router or relying on the KiCad ActionPlugin workflow.
 | `load_project_config` | Load project-specific config from `<project_dir>/.konnect/project.json`. Project overrides user. |
 | `save_project_config` | Save a project-specific rule or override (same dot-notation as `save_user_config`). |
 | `get_effective_config` | Return the merged config (user defaults + project overrides). The config Claude should use for design decisions. |
-| `add_design_rule` | Add a natural-language design rule Claude should follow. Examples: "Always use 100nF X7R for MCU decoupling within 3mm of power pin". |
+| `add_design_rule` | Append a natural-language design note for the agent. Not a DRC constraint setter — use `set_design_rules` for clearance/track/via minima. |
 | `list_design_rules` | List all active design rules (user-level + project-level). |
 
 ---

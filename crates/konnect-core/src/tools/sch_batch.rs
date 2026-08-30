@@ -8,8 +8,8 @@
 use crate::mcp::protocol::CallToolResult;
 use crate::tool;
 use crate::tools::{
-    find_all_symbol_instance_blocks, get_path, opt_str, require_array, require_f64, require_str,
-    ToolDef,
+    find_all_symbol_instance_blocks, get_path, opt_f64, opt_str, require_array, require_f64,
+    require_str, ToolDef,
 };
 use konnect_schematic_editor as cse;
 use konnect_sexp::{
@@ -27,8 +27,10 @@ use std::collections::{BTreeMap, BTreeSet, HashSet};
 use super::sch_connectivity::{ConnectivityIndex, COINCIDENT_TOLERANCE};
 // Re-use the single-item component placer and pin-to-pin router.
 use super::sch_components::{
-    commit_component_deletion, indexed_uuid_items, place_one_component, placed_component_readback,
-    plan_component_and_item_deletions, ComponentDeleteTargetError,
+    apply_field_position, commit_component_deletion, handle_autoplace_schematic_fields,
+    handle_set_schematic_field_position, indexed_uuid_items, place_one_component,
+    placed_component_readback, plan_component_and_item_deletions, ComponentDeleteTargetError,
+    FieldPosSpec,
 };
 use super::sch_wiring::{resolve_pin_endpoint, resolve_placed_pin, route_between};
 
@@ -191,6 +193,82 @@ pub fn tools() -> Vec<ToolDef> {
                 "required": ["schematic", "edits"]
             }),
             |args, ctx| async move { handle_batch_edit(args, ctx).await }
+        ),
+        tool!(
+            "set_schematic_field_position",
+            "Move one property on a placed symbol — Reference, Value, or any custom field — \
+             to an absolute sheet coordinate. Optional rotation is the field's own stored \
+             angle (KiCad composes it with the parent symbol's rotation when drawing). \
+             Optional justify is KiCad's effects justify list (left/right/top/bottom); \
+             omit it to leave justification alone, pass 'center' to clear it.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "schematic": { "type": "string", "description": "Path to .kicad_sch file" },
+                    "reference": { "type": "string", "description": "Symbol reference, e.g. 'C12'" },
+                    "field": { "type": "string", "description": "Property name: Reference, Value, or a custom field" },
+                    "x": { "type": "number", "description": "Absolute sheet X in mm" },
+                    "y": { "type": "number", "description": "Absolute sheet Y in mm" },
+                    "rotation": { "type": "number", "description": "Field angle in degrees. Omit to keep the current angle." },
+                    "justify": { "type": "string", "description": "KiCad justify tokens, space-separated. 'center' clears justify." }
+                },
+                "required": ["schematic", "reference", "field", "x", "y"]
+            }),
+            |args, ctx| async move { handle_set_schematic_field_position(args, ctx).await }
+        ),
+        tool!(
+            "autoplace_schematic_fields",
+            "Move any unhidden field whose drawn box is struck by a wire or by a \
+             component lead (pin-to-body) to the nearest clear 1.27 mm grid point. \
+             Models the field's effective angle (field rotation composed with the \
+             parent symbol) so a vertical label is not treated as a wide flat one. \
+             Use after reset_schematic_field_positions, which parks Reference on \
+             the pin of a vertical two-pin part hanging off a horizontal rail.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "schematic": { "type": "string", "description": "Path to .kicad_sch file" },
+                    "references": {
+                        "type": "array",
+                        "description": "Limit to these references. Omit to consider every symbol.",
+                        "items": { "type": "string" }
+                    },
+                    "dry_run": { "type": "boolean", "default": false,
+                        "description": "Report what would move without writing." }
+                },
+                "required": ["schematic"]
+            }),
+            |args, ctx| async move { handle_autoplace_schematic_fields(args, ctx).await }
+        ),
+        tool!(
+            "batch_set_schematic_field_positions",
+            "Move many schematic fields in one load/write. Each entry is a \
+             set_schematic_field_position argument object (reference, field, x, y, \
+             optional rotation, optional justify). Decluttering a sheet is 25–80 fields.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "schematic": { "type": "string", "description": "Path to .kicad_sch file" },
+                    "fields": {
+                        "type": "array",
+                        "description": "List of {reference, field, x, y, rotation?, justify?} objects",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "reference": { "type": "string" },
+                                "field": { "type": "string" },
+                                "x": { "type": "number" },
+                                "y": { "type": "number" },
+                                "rotation": { "type": "number" },
+                                "justify": { "type": "string" }
+                            },
+                            "required": ["reference", "field", "x", "y"]
+                        }
+                    }
+                },
+                "required": ["schematic", "fields"]
+            }),
+            |args, ctx| async move { handle_batch_set_schematic_field_positions(args, ctx).await }
         ),
         tool!(
             "batch_delete_schematic_components",
@@ -927,6 +1005,81 @@ async fn handle_batch_edit(
     Ok(CallToolResult::json(&json!({
         "updated_count": changed.len(),
         "updated": changed,
+        "errors": errors
+    })))
+}
+
+async fn handle_batch_set_schematic_field_positions(
+    args: &serde_json::Value,
+    _ctx: &crate::tools::ToolContext,
+) -> anyhow::Result<CallToolResult> {
+    let sch_path = get_path(args, "schematic")?;
+    let fields = match require_array(args, "fields") {
+        Ok(a) => a,
+        Err(e) => return Ok(e),
+    };
+
+    let mut sch = cse::Schematic::load(&sch_path)?;
+    let mut moved = Vec::new();
+    let mut unchanged = Vec::new();
+    let mut errors = Vec::new();
+
+    for entry in fields {
+        let reference = match require_str(entry, "reference") {
+            Ok(v) => v.to_string(),
+            Err(_) => {
+                errors.push("Missing 'reference' in field entry".to_string());
+                continue;
+            }
+        };
+        let field = match require_str(entry, "field") {
+            Ok(v) => v.to_string(),
+            Err(_) => {
+                errors.push(format!("Missing 'field' for '{reference}'"));
+                continue;
+            }
+        };
+        let x = match require_f64(entry, "x") {
+            Ok(v) => v,
+            Err(_) => {
+                errors.push(format!("Missing 'x' for '{reference}.{field}'"));
+                continue;
+            }
+        };
+        let y = match require_f64(entry, "y") {
+            Ok(v) => v,
+            Err(_) => {
+                errors.push(format!("Missing 'y' for '{reference}.{field}'"));
+                continue;
+            }
+        };
+        let spec = FieldPosSpec {
+            reference: reference.clone(),
+            field: field.clone(),
+            x,
+            y,
+            rotation: opt_f64(entry, "rotation"),
+            justify: opt_str(entry, "justify").map(str::to_string),
+        };
+        match apply_field_position(&mut sch, &spec) {
+            Ok(Some(change)) => moved.push(json!({
+                "field": format!("{}.{}", change.reference, change.field),
+                "from": [change.from.0, change.from.1],
+                "to": [change.to.0, change.to.1]
+            })),
+            Ok(None) => unchanged.push(format!("{reference}.{field}")),
+            Err(message) => errors.push(message),
+        }
+    }
+
+    if !moved.is_empty() {
+        sch.overwrite()?;
+    }
+
+    Ok(CallToolResult::json(&json!({
+        "moved": moved,
+        "moved_count": moved.len(),
+        "unchanged": unchanged,
         "errors": errors
     })))
 }
@@ -1979,6 +2132,51 @@ mod batch_place_and_connect_tests {
         .await
         .unwrap();
         assert!(result.is_error, "{result:?}");
+    }
+
+    #[tokio::test]
+    async fn batch_set_schematic_field_positions_moves_several_fields() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("fields.kicad_sch");
+        std::fs::write(
+            &path,
+            "(kicad_sch\n  (version 20250610)\n  (generator \"konnect\")\n  (uuid \"aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee\")\n  (paper \"A4\")\n  (lib_symbols\n    (symbol \"Device:R\"\n      (property \"Reference\" \"R\" (at 2.032 0 90))\n      (property \"Value\" \"R\" (at 0 0 90))\n    )\n  )\n  (symbol\n    (lib_id \"Device:R\")\n    (at 101.6 50.8 0)\n    (unit 1)\n    (uuid \"bbbbbbbb-bbbb-cccc-dddd-eeeeeeeeeeee\")\n    (property \"Reference\" \"R1\" (at 101.6 46.99 0))\n    (property \"Value\" \"10k\" (at 101.6 54.61 0))\n  )\n)\n",
+        )
+        .unwrap();
+
+        let result = handle_batch_set_schematic_field_positions(
+            &json!({
+                "schematic": path.display().to_string(),
+                "fields": [
+                    { "reference": "R1", "field": "Reference", "x": 98.0, "y": 47.0 },
+                    { "reference": "R1", "field": "Value", "x": 105.0, "y": 54.0 },
+                    { "reference": "R9", "field": "Reference", "x": 0.0, "y": 0.0 }
+                ]
+            }),
+            &test_ctx(),
+        )
+        .await
+        .unwrap();
+        assert!(!result.is_error, "{result:?}");
+        let crate::mcp::protocol::ToolContent::Text { text } = &result.content[0] else {
+            panic!("expected text")
+        };
+        let body: serde_json::Value = serde_json::from_str(text).unwrap();
+        assert_eq!(body["moved_count"], 2);
+        assert_eq!(body["errors"].as_array().unwrap().len(), 1);
+
+        let sch = cse::Schematic::load(&path).unwrap();
+        let r1 = sch.symbols.by_reference("R1").unwrap();
+        let at = |name: &str| {
+            r1.properties
+                .iter()
+                .find(|p| p.name == name)
+                .and_then(|p| p.sub_nodes.iter().find(|n| n.tag() == Some("at")))
+                .map(cse::sexp::writer::write)
+                .unwrap()
+        };
+        assert!(at("Reference").contains("98"), "{}", at("Reference"));
+        assert!(at("Value").contains("105"), "{}", at("Value"));
     }
 
     /// Six single-pin instances of a synthetic part, positioned so that

@@ -3221,6 +3221,402 @@ fn set_property_at(prop: &mut cse::types::Property, x: f64, y: f64, rotation: f6
     true
 }
 
+pub(crate) struct FieldPosSpec {
+    pub reference: String,
+    pub field: String,
+    pub x: f64,
+    pub y: f64,
+    pub rotation: Option<f64>,
+    pub justify: Option<String>,
+}
+
+pub(crate) struct FieldPosChange {
+    pub reference: String,
+    pub field: String,
+    pub from: (f64, f64),
+    pub to: (f64, f64),
+}
+
+fn property_at(prop: &cse::types::Property) -> Option<(f64, f64, f64)> {
+    let at = prop.sub_nodes.iter().find(|n| n.tag() == Some("at"))?;
+    let args = at.scalar_args();
+    Some((
+        args.first()?.parse().ok()?,
+        args.get(1)?.parse().ok()?,
+        args.get(2).and_then(|s| s.parse().ok()).unwrap_or(0.0),
+    ))
+}
+
+fn property_hidden(prop: &cse::types::Property) -> bool {
+    prop.sub_nodes
+        .iter()
+        .any(|n| n.tag() == Some("hide") && n.value().is_some_and(|v| v == "yes" || v == "true"))
+}
+
+fn set_property_justify(prop: &mut cse::types::Property, justify: &str) {
+    use cse::sexp::{atom, tagged, SexpNode};
+
+    let tokens: Vec<String> = justify
+        .split_whitespace()
+        .filter(|token| !token.eq_ignore_ascii_case("center"))
+        .map(|token| token.to_ascii_lowercase())
+        .collect();
+
+    let Some(effects_idx) = prop
+        .sub_nodes
+        .iter()
+        .position(|n| n.tag() == Some("effects"))
+    else {
+        if tokens.is_empty() {
+            return;
+        }
+        let mut args = vec![tagged(
+            "font",
+            vec![tagged("size", vec![atom("1.27"), atom("1.27")])],
+        )];
+        let mut justify_node = vec![atom("justify")];
+        justify_node.extend(tokens.into_iter().map(atom));
+        args.push(SexpNode::List(justify_node));
+        prop.sub_nodes.push(tagged("effects", args));
+        return;
+    };
+
+    let SexpNode::List(children) = &mut prop.sub_nodes[effects_idx] else {
+        return;
+    };
+    if tokens.is_empty() {
+        children.retain(|n| n.tag() != Some("justify"));
+        return;
+    }
+    let mut justify_node = vec![atom("justify")];
+    justify_node.extend(tokens.into_iter().map(atom));
+    let replacement = SexpNode::List(justify_node);
+    if let Some(existing) = children.iter_mut().find(|n| n.tag() == Some("justify")) {
+        *existing = replacement;
+    } else {
+        children.push(replacement);
+    }
+}
+
+pub(crate) fn apply_field_position(
+    sch: &mut cse::Schematic,
+    spec: &FieldPosSpec,
+) -> Result<Option<FieldPosChange>, String> {
+    let Some(sym) = sch.symbols.by_reference_mut(&spec.reference) else {
+        return Err(format!(
+            "symbol '{}' not found in this schematic",
+            spec.reference
+        ));
+    };
+    let Some(prop) = sym
+        .properties
+        .iter_mut()
+        .find(|prop| prop.name == spec.field)
+    else {
+        return Err(format!(
+            "field '{}' not found on '{}'",
+            spec.field, spec.reference
+        ));
+    };
+    let (old_x, old_y, old_rot) = property_at(prop).unwrap_or((0.0, 0.0, 0.0));
+    let rotation = spec.rotation.unwrap_or(old_rot);
+    let moved = set_property_at(prop, spec.x, spec.y, rotation);
+    if let Some(justify) = spec.justify.as_deref() {
+        set_property_justify(prop, justify);
+    }
+    if !moved
+        && spec.justify.is_none()
+        && spec
+            .rotation
+            .is_none_or(|value| (value - old_rot).abs() < 1e-9)
+    {
+        return Ok(None);
+    }
+    Ok(Some(FieldPosChange {
+        reference: spec.reference.clone(),
+        field: spec.field.clone(),
+        from: (old_x, old_y),
+        to: (spec.x, spec.y),
+    }))
+}
+
+pub(crate) async fn handle_set_schematic_field_position(
+    args: &serde_json::Value,
+    _ctx: &ToolContext,
+) -> anyhow::Result<CallToolResult> {
+    let sch_path = get_path(args, "schematic")?;
+    let reference = match require_str(args, "reference") {
+        Ok(v) => v.to_string(),
+        Err(e) => return Ok(e),
+    };
+    let field = match require_str(args, "field") {
+        Ok(v) => v.to_string(),
+        Err(e) => return Ok(e),
+    };
+    let x = match require_f64(args, "x") {
+        Ok(v) => v,
+        Err(e) => return Ok(e),
+    };
+    let y = match require_f64(args, "y") {
+        Ok(v) => v,
+        Err(e) => return Ok(e),
+    };
+    let spec = FieldPosSpec {
+        reference,
+        field,
+        x,
+        y,
+        rotation: opt_f64(args, "rotation"),
+        justify: opt_str(args, "justify").map(str::to_string),
+    };
+    let mut sch = cse::Schematic::load(&sch_path)?;
+    match apply_field_position(&mut sch, &spec) {
+        Ok(Some(change)) => {
+            sch.overwrite()?;
+            Ok(CallToolResult::json(&json!({
+                "moved": format!("{}.{}", change.reference, change.field),
+                "from": [change.from.0, change.from.1],
+                "to": [change.to.0, change.to.1]
+            })))
+        }
+        Ok(None) => Ok(CallToolResult::json(&json!({
+            "moved": serde_json::Value::Null,
+            "unchanged": format!("{}.{}", spec.reference, spec.field)
+        }))),
+        Err(message) => Ok(CallToolResult::error(message)),
+    }
+}
+
+const FIELD_CHAR_WIDTH_MM: f64 = 1.22;
+const FIELD_HEIGHT_MM: f64 = 1.27;
+const AUTOPLACE_GRID_MM: f64 = 1.27;
+
+#[derive(Clone, Copy)]
+struct TextBox {
+    cx: f64,
+    cy: f64,
+    half_w: f64,
+    half_h: f64,
+    angle_rad: f64,
+}
+
+impl TextBox {
+    fn from_field(prop: &cse::types::Property, symbol_rotation_deg: f64) -> Option<Self> {
+        let (x, y, field_rot) = property_at(prop)?;
+        let n = prop.value.chars().count().max(1) as f64;
+        let width = n * FIELD_CHAR_WIDTH_MM;
+        let height = FIELD_HEIGHT_MM;
+        let effective = (symbol_rotation_deg + field_rot).rem_euclid(360.0);
+        Some(TextBox {
+            cx: x,
+            cy: y,
+            half_w: width / 2.0,
+            half_h: height / 2.0,
+            angle_rad: effective.to_radians(),
+        })
+    }
+
+    fn at(self, x: f64, y: f64) -> Self {
+        TextBox {
+            cx: x,
+            cy: y,
+            ..self
+        }
+    }
+
+    fn local_xy(self, x: f64, y: f64) -> (f64, f64) {
+        let dx = x - self.cx;
+        let dy = y - self.cy;
+        let cos = self.angle_rad.cos();
+        let sin = self.angle_rad.sin();
+        (dx * cos + dy * sin, -dx * sin + dy * cos)
+    }
+
+    fn contains_local(self, x: f64, y: f64) -> bool {
+        let (lx, ly) = self.local_xy(x, y);
+        lx.abs() <= self.half_w && ly.abs() <= self.half_h
+    }
+
+    fn struck_by(self, start: (f64, f64), end: (f64, f64)) -> bool {
+        if self.contains_local(start.0, start.1) || self.contains_local(end.0, end.1) {
+            return true;
+        }
+        let (ax, ay) = self.local_xy(start.0, start.1);
+        let (bx, by) = self.local_xy(end.0, end.1);
+        segment_hits_aabb(ax, ay, bx, by, self.half_w, self.half_h)
+    }
+}
+
+type Obstacle = ((f64, f64), (f64, f64));
+
+/// Liang–Barsky clip of a segment against an origin-centred AABB.
+/// An endpoint inside the box is already handled by the caller; a lead that
+/// terminates inside the text still counts because that endpoint test runs
+/// first.
+fn segment_hits_aabb(ax: f64, ay: f64, bx: f64, by: f64, half_w: f64, half_h: f64) -> bool {
+    let mut t0 = 0.0;
+    let mut t1 = 1.0;
+    let dx = bx - ax;
+    let dy = by - ay;
+    let mut clip = |p: f64, q: f64| -> bool {
+        if p.abs() < 1e-15 {
+            return q >= 0.0;
+        }
+        let r = q / p;
+        if p < 0.0 {
+            if r > t1 {
+                return false;
+            }
+            if r > t0 {
+                t0 = r;
+            }
+        } else {
+            if r < t0 {
+                return false;
+            }
+            if r < t1 {
+                t1 = r;
+            }
+        }
+        true
+    };
+    clip(-dx, ax + half_w)
+        && clip(dx, half_w - ax)
+        && clip(-dy, ay + half_h)
+        && clip(dy, half_h - ay)
+}
+
+fn obstacle_segments(sch: &cse::Schematic, content: &str) -> Vec<Obstacle> {
+    let mut segments: Vec<Obstacle> = sch
+        .wires
+        .iter()
+        .map(|wire| (wire.start, wire.end))
+        .collect();
+    if let Ok(tree) = parse_sexp(content) {
+        let lib_syms = tree
+            .find("lib_symbols")
+            .map(|node| node.find_all("symbol"))
+            .unwrap_or_default();
+        for inst in extract_symbol_instances(&tree) {
+            let Some(lib) = find_lib_symbol(&lib_syms, &inst) else {
+                continue;
+            };
+            let transform = inst.pin_transform();
+            for pin in extract_lib_pins_for_unit(lib, inst.unit) {
+                let (px, py) = pin_endpoint(&pin, transform);
+                segments.push(((inst.x, inst.y), (px, py)));
+            }
+        }
+    }
+    segments
+}
+
+fn field_collides(box_: TextBox, obstacles: &[Obstacle]) -> bool {
+    obstacles
+        .iter()
+        .any(|&(start, end)| box_.struck_by(start, end))
+}
+
+fn nearest_clear_spot(box_: TextBox, obstacles: &[Obstacle]) -> Option<(f64, f64)> {
+    if !field_collides(box_, obstacles) {
+        return None;
+    }
+    let origin_x = (box_.cx / AUTOPLACE_GRID_MM).round() * AUTOPLACE_GRID_MM;
+    let origin_y = (box_.cy / AUTOPLACE_GRID_MM).round() * AUTOPLACE_GRID_MM;
+    let mut best: Option<(f64, (f64, f64))> = None;
+    for ring in 1i32..=8 {
+        for dx in -ring..=ring {
+            for dy in -ring..=ring {
+                if dx.abs() != ring && dy.abs() != ring {
+                    continue;
+                }
+                let x = origin_x + dx as f64 * AUTOPLACE_GRID_MM;
+                let y = origin_y + dy as f64 * AUTOPLACE_GRID_MM;
+                if field_collides(box_.at(x, y), obstacles) {
+                    continue;
+                }
+                let dist = (x - box_.cx).hypot(y - box_.cy);
+                if best.is_none_or(|(best_dist, _)| dist < best_dist) {
+                    best = Some((dist, (x, y)));
+                }
+            }
+        }
+        if best.is_some() {
+            break;
+        }
+    }
+    best.map(|(_, xy)| xy)
+}
+
+pub(crate) async fn handle_autoplace_schematic_fields(
+    args: &serde_json::Value,
+    _ctx: &ToolContext,
+) -> anyhow::Result<CallToolResult> {
+    let sch_path = get_path(args, "schematic")?;
+    let only: Option<std::collections::HashSet<String>> = args["references"].as_array().map(|a| {
+        a.iter()
+            .filter_map(|v| v.as_str().map(String::from))
+            .collect()
+    });
+    let dry_run = args["dry_run"].as_bool().unwrap_or(false);
+
+    let mut sch = cse::Schematic::load(&sch_path)?;
+    let content = std::fs::read_to_string(&sch_path)?;
+    let obstacles = obstacle_segments(&sch, &content);
+
+    let mut plans: Vec<(String, String, f64, f64)> = Vec::new();
+    for sym in sch.symbols.iter() {
+        let Some(reference) = sym.reference().map(str::to_string) else {
+            continue;
+        };
+        if only.as_ref().is_some_and(|set| !set.contains(&reference)) {
+            continue;
+        }
+        let symbol_rot = sym.at.rotation.unwrap_or(0.0);
+        for prop in &sym.properties {
+            if property_hidden(prop) {
+                continue;
+            }
+            let Some(box_) = TextBox::from_field(prop, symbol_rot) else {
+                continue;
+            };
+            let Some((x, y)) = nearest_clear_spot(box_, &obstacles) else {
+                continue;
+            };
+            plans.push((reference.clone(), prop.name.clone(), x, y));
+        }
+    }
+
+    let mut moved = Vec::new();
+    for (reference, field, x, y) in &plans {
+        let spec = FieldPosSpec {
+            reference: reference.clone(),
+            field: field.clone(),
+            x: *x,
+            y: *y,
+            rotation: None,
+            justify: None,
+        };
+        if let Ok(Some(change)) = apply_field_position(&mut sch, &spec) {
+            moved.push(json!({
+                "field": format!("{}.{}", change.reference, change.field),
+                "from": [change.from.0, change.from.1],
+                "to": [change.to.0, change.to.1]
+            }));
+        }
+    }
+
+    if !moved.is_empty() && !dry_run {
+        sch.overwrite()?;
+    }
+
+    Ok(CallToolResult::json(&json!({
+        "moved": moved,
+        "moved_count": moved.len(),
+        "dry_run": dry_run
+    })))
+}
+
 async fn handle_replace_component(
     args: &serde_json::Value,
     _ctx: &ToolContext,
@@ -4567,6 +4963,153 @@ mod tests {
             body["no_property"],
             json!(["R1.Value"]),
             "the skipped field must be accounted for: {body}"
+        );
+    }
+
+    fn stale_resistor_sheet() -> &'static str {
+        "(kicad_sch\n  (version 20250610)\n  (generator \"konnect\")\n  (uuid \"aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee\")\n  (paper \"A4\")\n  (lib_symbols\n    (symbol \"Device:R\"\n      (property \"Reference\" \"R\" (at 2.032 0 90))\n      (property \"Value\" \"R\" (at 0 0 90))\n    )\n  )\n  (symbol\n    (lib_id \"Device:R\")\n    (at 101.6 50.8 0)\n    (unit 1)\n    (uuid \"bbbbbbbb-bbbb-cccc-dddd-eeeeeeeeeeee\")\n    (property \"Reference\" \"R1\" (at 101.6 46.99 0))\n    (property \"Value\" \"10k\" (at 101.6 54.61 0))\n  )\n)\n"
+    }
+
+    fn field_sexp(path: &std::path::Path, reference: &str, name: &str) -> String {
+        let sch = cse::Schematic::load(path).unwrap();
+        let sym = sch.symbols.by_reference(reference).expect(reference);
+        cse::sexp::writer::write(
+            &sym.properties
+                .iter()
+                .find(|p| p.name == name)
+                .unwrap()
+                .to_sexp(),
+        )
+    }
+
+    #[tokio::test]
+    async fn set_schematic_field_position_moves_one_field() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("move-field.kicad_sch");
+        std::fs::write(&path, stale_resistor_sheet()).unwrap();
+
+        let result = handle_set_schematic_field_position(
+            &json!({
+                "schematic": path.display().to_string(),
+                "reference": "R1",
+                "field": "Reference",
+                "x": 98.0,
+                "y": 47.5,
+                "rotation": 90.0,
+                "justify": "left"
+            }),
+            &test_ctx(),
+        )
+        .await
+        .unwrap();
+        assert!(!result.is_error, "{result:?}");
+
+        let reference = field_sexp(&path, "R1", "Reference");
+        assert!(
+            reference.contains("(at 98 47.5 90)"),
+            "Reference at: {reference}"
+        );
+        assert!(
+            reference.contains("(justify left)"),
+            "justify written: {reference}"
+        );
+        let value = field_sexp(&path, "R1", "Value");
+        assert!(
+            value.contains("(at 101.6 54.61 0)"),
+            "Value must be left alone: {value}"
+        );
+    }
+
+    #[tokio::test]
+    async fn set_schematic_field_position_refuses_a_missing_field() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("missing-field.kicad_sch");
+        std::fs::write(&path, stale_resistor_sheet()).unwrap();
+        let result = handle_set_schematic_field_position(
+            &json!({
+                "schematic": path.display().to_string(),
+                "reference": "R1",
+                "field": "MPN",
+                "x": 0.0,
+                "y": 0.0
+            }),
+            &test_ctx(),
+        )
+        .await
+        .unwrap();
+        assert!(result.is_error, "{result:?}");
+        let msg = format!("{:?}", result.content);
+        assert!(msg.contains("MPN"), "{msg}");
+    }
+
+    #[tokio::test]
+    async fn autoplace_moves_a_field_off_a_wire() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("rail.kicad_sch");
+        // Vertical two-pin part on a horizontal rail: Reference sits on the
+        // wire. Autoplace must move it off y = 50.8.
+        std::fs::write(
+            &path,
+            "(kicad_sch\n  (version 20250610)\n  (generator \"konnect\")\n  (uuid \"aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee\")\n  (paper \"A4\")\n  (lib_symbols\n    (symbol \"Device:C\"\n      (property \"Reference\" \"C\" (at 0.635 2.54 0))\n      (property \"Value\" \"C\" (at 0.635 -2.54 0))\n    )\n  )\n  (symbol\n    (lib_id \"Device:C\")\n    (at 101.6 50.8 0)\n    (unit 1)\n    (uuid \"bbbbbbbb-bbbb-cccc-dddd-eeeeeeeeeeee\")\n    (property \"Reference\" \"C1\" (at 101.6 50.8 0))\n    (property \"Value\" \"100nF\" (at 101.6 48.26 0))\n  )\n  (wire\n    (pts (xy 80 50.8) (xy 120 50.8))\n    (stroke (width 0) (type default))\n    (uuid \"cccccccc-bbbb-cccc-dddd-eeeeeeeeeeee\")\n  )\n)\n",
+        )
+        .unwrap();
+
+        let result = handle_autoplace_schematic_fields(
+            &json!({ "schematic": path.display().to_string() }),
+            &test_ctx(),
+        )
+        .await
+        .unwrap();
+        assert!(!result.is_error, "{result:?}");
+        let crate::mcp::protocol::ToolContent::Text { text } = &result.content[0] else {
+            panic!("expected text")
+        };
+        let body: serde_json::Value = serde_json::from_str(text).unwrap();
+        assert!(
+            body["moved_count"].as_u64().unwrap() >= 1,
+            "expected at least Reference to move off the rail: {body}"
+        );
+
+        let reference = field_sexp(&path, "C1", "Reference");
+        assert!(
+            !reference.contains("(at 101.6 50.8"),
+            "Reference still on the rail: {reference}"
+        );
+    }
+
+    #[test]
+    fn composed_field_angle_treats_a_vertical_label_as_tall() {
+        // A field stored at 0° on a 270° symbol draws vertically. Modelling
+        // that as a wide flat box misses the collision with a horizontal rail.
+        let prop = cse::types::Property {
+            name: "Reference".into(),
+            value: "C12".into(),
+            sub_nodes: vec![cse::sexp::tagged(
+                "at",
+                vec![
+                    cse::sexp::atom("101.6"),
+                    cse::sexp::atom("50.8"),
+                    cse::sexp::atom("0"),
+                ],
+            )],
+        };
+        let vertical = TextBox::from_field(&prop, 270.0).unwrap();
+        let flat = TextBox::from_field(&prop, 0.0).unwrap();
+        // 1.2 mm off the origin: taller than a 1.27 mm glyph, shorter than
+        // "C12" laid out vertically (3 × 1.22 mm).
+        let offset_rail = ((80.0, 52.0), (120.0, 52.0));
+        assert!(
+            vertical.struck_by(offset_rail.0, offset_rail.1),
+            "composed 270° makes the label tall enough to hit a rail 1.2 mm off origin"
+        );
+        assert!(
+            !flat.struck_by(offset_rail.0, offset_rail.1),
+            "uncomposed 0° is a wide flat box that misses that rail"
+        );
+        let lead = ((101.6, 50.8), (101.6, 47.26));
+        assert!(
+            vertical.struck_by(lead.0, lead.1),
+            "a component lead ending inside the box must count as a strike"
         );
     }
 

@@ -280,6 +280,12 @@ coherent functional grouping, label-inclusive overlap inspection, clear signal
 flow, and page-boundary acceptance for every symbol, label, and note. Inspect
 the image itself; a successful render command is not visual acceptance.
 
+`reset_schematic_field_positions` parks Reference on the pin of a vertical
+two-pin part hanging off a horizontal rail. After a reset, load `sch_batch`
+and run `autoplace_schematic_fields` or `set_schematic_field_position` (or
+`batch_set_schematic_field_positions`) so text does not sit on wires or on
+the part's own lead.
+
 ## Evidence and completion gate
 
 Apply this order when evidence disagrees:
