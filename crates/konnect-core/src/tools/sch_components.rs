@@ -3565,6 +3565,7 @@ pub(crate) async fn handle_autoplace_schematic_fields(
     let obstacles = obstacle_segments(&sch, &content);
 
     let mut plans: Vec<(String, String, f64, f64)> = Vec::new();
+    let mut skipped = Vec::new();
     for sym in sch.symbols.iter() {
         let Some(reference) = sym.reference().map(str::to_string) else {
             continue;
@@ -3574,16 +3575,26 @@ pub(crate) async fn handle_autoplace_schematic_fields(
         }
         let symbol_rot = sym.at.rotation.unwrap_or(0.0);
         for prop in &sym.properties {
+            // Only Reference/Value are cosmetic. A net label's position *is*
+            // its attachment point; pin names, notes and the sheet border
+            // stay put.
+            if prop.name != "Reference" && prop.name != "Value" {
+                continue;
+            }
             if property_hidden(prop) {
                 continue;
             }
             let Some(box_) = TextBox::from_field(prop, symbol_rot) else {
                 continue;
             };
-            let Some((x, y)) = nearest_clear_spot(box_, &obstacles) else {
-                continue;
-            };
-            plans.push((reference.clone(), prop.name.clone(), x, y));
+            match nearest_clear_spot(box_, &obstacles) {
+                Some((x, y)) => plans.push((reference.clone(), prop.name.clone(), x, y)),
+                None if field_collides(box_, &obstacles) => skipped.push(json!({
+                    "field": format!("{}.{}", reference, prop.name),
+                    "reason": "no clear spot"
+                })),
+                None => {}
+            }
         }
     }
 
@@ -3613,6 +3624,8 @@ pub(crate) async fn handle_autoplace_schematic_fields(
     Ok(CallToolResult::json(&json!({
         "moved": moved,
         "moved_count": moved.len(),
+        "skipped": skipped,
+        "skipped_count": skipped.len(),
         "dry_run": dry_run
     })))
 }
@@ -5069,11 +5082,75 @@ mod tests {
             body["moved_count"].as_u64().unwrap() >= 1,
             "expected at least Reference to move off the rail: {body}"
         );
+        assert!(
+            body["skipped"].is_array(),
+            "skipped must be reported: {body}"
+        );
 
         let reference = field_sexp(&path, "C1", "Reference");
         assert!(
             !reference.contains("(at 101.6 50.8"),
             "Reference still on the rail: {reference}"
+        );
+    }
+
+    #[tokio::test]
+    async fn autoplace_on_a_rail_of_caps_clears_collisions_or_reports_skipped() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("decoupling.kicad_sch");
+        let mut sheet = String::from(
+            "(kicad_sch\n  (version 20250610)\n  (generator \"konnect\")\n  (uuid \"aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee\")\n  (paper \"A4\")\n  (lib_symbols\n    (symbol \"Device:C\"\n      (property \"Reference\" \"C\" (at 0.635 2.54 0))\n      (property \"Value\" \"C\" (at 0.635 -2.54 0))\n    )\n  )\n",
+        );
+        for (i, x) in [90.17, 101.6, 113.03].iter().enumerate() {
+            let n = i + 1;
+            sheet.push_str(&format!(
+                "  (symbol\n    (lib_id \"Device:C\")\n    (at {x} 50.8 0)\n    (unit 1)\n    (uuid \"bbbbbbbb-bbbb-cccc-dddd-eeeeeeeeeee{n}\")\n    (property \"Reference\" \"C{n}\" (at {x} 54.61 90))\n    (property \"Value\" \"100nF\" (at {x} 50.8 0))\n  )\n"
+            ));
+        }
+        sheet.push_str(
+            "  (wire\n    (pts (xy 80 50.8) (xy 130 50.8))\n    (stroke (width 0) (type default))\n    (uuid \"cccccccc-bbbb-cccc-dddd-eeeeeeeeeeee\")\n  )\n)\n",
+        );
+        std::fs::write(&path, sheet).unwrap();
+
+        handle_reset_schematic_field_positions(
+            &json!({ "schematic": path.display().to_string() }),
+            &test_ctx(),
+        )
+        .await
+        .unwrap();
+        let result = handle_autoplace_schematic_fields(
+            &json!({ "schematic": path.display().to_string() }),
+            &test_ctx(),
+        )
+        .await
+        .unwrap();
+        assert!(!result.is_error, "{result:?}");
+        let crate::mcp::protocol::ToolContent::Text { text } = &result.content[0] else {
+            panic!("expected text")
+        };
+        let body: serde_json::Value = serde_json::from_str(text).unwrap();
+        let content = std::fs::read_to_string(&path).unwrap();
+        let sch = cse::Schematic::load(&path).unwrap();
+        let obstacles = obstacle_segments(&sch, &content);
+        let mut remaining = 0u32;
+        for sym in sch.symbols.iter() {
+            let rot = sym.at.rotation.unwrap_or(0.0);
+            for prop in &sym.properties {
+                if prop.name != "Reference" && prop.name != "Value" {
+                    continue;
+                }
+                let Some(box_) = TextBox::from_field(prop, rot) else {
+                    continue;
+                };
+                if field_collides(box_, &obstacles) {
+                    remaining += 1;
+                }
+            }
+        }
+        let skipped = body["skipped_count"].as_u64().unwrap_or(0);
+        assert!(
+            remaining == 0 || skipped >= remaining as u64,
+            "leftover collisions must be reported as skipped: remaining={remaining} body={body}"
         );
     }
 
@@ -5111,6 +5188,185 @@ mod tests {
             vertical.struck_by(lead.0, lead.1),
             "a component lead ending inside the box must count as a strike"
         );
+    }
+
+    /// Port of check_collisions.py: kicad-cli SVG text boxes vs drawn paths.
+    fn attr_f64(tag: &str, name: &str) -> Option<f64> {
+        let needle = format!("{name}=\"");
+        let start = tag.find(&needle)? + needle.len();
+        let end = tag[start..].find('"')?;
+        tag[start..start + end].parse().ok()
+    }
+
+    fn attr_str<'a>(tag: &'a str, name: &str) -> Option<&'a str> {
+        let needle = format!("{name}=\"");
+        let start = tag.find(&needle)? + needle.len();
+        let end = tag[start..].find('"')?;
+        Some(&tag[start..start + end])
+    }
+
+    fn svg_text_boxes(svg: &str) -> Vec<(String, f64, f64, f64, f64)> {
+        let mut out = Vec::new();
+        let mut rest = svg;
+        let mut abs = 0usize;
+        while let Some(rel) = rest.find("<text ") {
+            let start = abs + rel;
+            let after = &svg[start..];
+            let Some(tag_end) = after.find('>') else {
+                break;
+            };
+            let tag = &after[..tag_end];
+            let Some(close) = after.find("</text>") else {
+                break;
+            };
+            let txt = after[tag_end + 1..close].to_string();
+            if tag.contains("opacity=\"0\"") {
+                if let (Some(x), Some(y), Some(tl), Some(fs), Some(anch)) = (
+                    attr_f64(tag, "x"),
+                    attr_f64(tag, "y"),
+                    attr_f64(tag, "textLength"),
+                    attr_f64(tag, "font-size"),
+                    attr_str(tag, "text-anchor"),
+                ) {
+                    let x0 = match anch {
+                        "middle" => x - tl / 2.0,
+                        "end" => x - tl,
+                        _ => x,
+                    };
+                    let mut bx0 = x0;
+                    let mut by0 = y - fs * 0.78;
+                    let mut bx1 = x0 + tl;
+                    let mut by1 = y + fs * 0.22;
+                    let prefix = &svg[start.saturating_sub(200)..start];
+                    if let Some(rot_at) = prefix.rfind("rotate(") {
+                        let args = &prefix[rot_at + 7..];
+                        let mut nums = args
+                            .split(|c: char| c == ')' || c.is_whitespace())
+                            .filter_map(|s| s.parse::<f64>().ok());
+                        if let (Some(ang), Some(cx), Some(cy)) =
+                            (nums.next(), nums.next(), nums.next())
+                        {
+                            let a = ang.to_radians();
+                            let (ca, sa) = (a.cos(), a.sin());
+                            let corners = [(bx0, by0), (bx1, by0), (bx1, by1), (bx0, by1)];
+                            let mut xs = [0.0; 4];
+                            let mut ys = [0.0; 4];
+                            for (i, (px, py)) in corners.iter().enumerate() {
+                                let dx = px - cx;
+                                let dy = py - cy;
+                                xs[i] = cx + dx * ca - dy * sa;
+                                ys[i] = cy + dx * sa + dy * ca;
+                            }
+                            bx0 = xs.iter().copied().fold(f64::INFINITY, f64::min);
+                            by0 = ys.iter().copied().fold(f64::INFINITY, f64::min);
+                            bx1 = xs.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+                            by1 = ys.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+                        }
+                    }
+                    out.push((txt, bx0, by0, bx1, by1));
+                }
+            }
+            let advance = close + 7;
+            abs = start + advance;
+            rest = &svg[abs..];
+        }
+        out
+    }
+
+    fn svg_path_segments(svg: &str) -> Vec<(f64, f64, f64, f64)> {
+        let mut segs = Vec::new();
+        let mut rest = svg;
+        while let Some(rel) = rest.find("<path ") {
+            let after = &rest[rel..];
+            let Some(d_at) = after.find("d=\"") else {
+                rest = &after[6..];
+                continue;
+            };
+            let d = &after[d_at + 3..];
+            let Some(d_end) = d.find('"') else {
+                break;
+            };
+            let mut pts = Vec::new();
+            let mut chars = d[..d_end].split_whitespace().peekable();
+            while let Some(tok) = chars.next() {
+                if tok == "M" || tok == "L" || tok.starts_with('M') || tok.starts_with('L') {
+                    let num = if tok.len() > 1 {
+                        &tok[1..]
+                    } else {
+                        chars.next().unwrap_or("")
+                    };
+                    let x: f64 = num.parse().unwrap_or(f64::NAN);
+                    let y: f64 = chars.next().unwrap_or("").parse().unwrap_or(f64::NAN);
+                    if x.is_finite() && y.is_finite() {
+                        pts.push((x, y));
+                    }
+                }
+            }
+            for pair in pts.windows(2) {
+                segs.push((pair[0].0, pair[0].1, pair[1].0, pair[1].1));
+            }
+            rest = &after[d_at + 3 + d_end + 1..];
+        }
+        segs
+    }
+
+    fn svg_line_through_text(svg: &str, wanted: &[&str]) -> usize {
+        let segs = svg_path_segments(svg);
+        let boxes = svg_text_boxes(svg);
+        let mut bad = 0;
+        for (txt, bx0, by0, bx1, by1) in &boxes {
+            if !wanted.iter().any(|w| *w == txt) {
+                continue;
+            }
+            for (x1, y1, x2, y2) in &segs {
+                let len = (x1 - x2).abs() + (y1 - y2).abs();
+                if len < 2.5 {
+                    continue;
+                }
+                let hit = if (y1 - y2).abs() < 1e-6 {
+                    *by0 <= *y1 && *y1 <= *by1 && x1.min(*x2) < *bx1 && x1.max(*x2) > *bx0
+                } else if (x1 - x2).abs() < 1e-6 {
+                    *bx0 <= *x1 && *x1 <= *bx1 && y1.min(*y2) < *by1 && y1.max(*y2) > *by0
+                } else {
+                    false
+                };
+                if hit {
+                    bad += 1;
+                    break;
+                }
+            }
+        }
+        bad
+    }
+
+    #[test]
+    fn svg_checker_filters_glyph_strokes_and_honours_rotation() {
+        let svg = concat!(
+            r#"<text x="10" y="10" textLength="6" font-size="1.69" text-anchor="middle" opacity="0">C1</text>"#,
+            r#"<path d="M 0 10 L 20 10"/>"#,
+            r#"<path d="M 9.5 10 L 10.2 10"/>"#,
+            r#"<g transform="rotate(90 30 10)">"#,
+            r#"<text x="30" y="10" textLength="6" font-size="1.69" text-anchor="middle" opacity="0">C2</text>"#,
+            r#"</g>"#,
+            r#"<path d="M 30 0 L 30 20"/>"#,
+        );
+        assert_eq!(svg_line_through_text(svg, &["C1"]), 1);
+        // C2 is vertical; a vertical lead through its origin still counts, a
+        // long horizontal neighbour does not invent a collision.
+        let only_horizontal = concat!(
+            r#"<g transform="rotate(90 30 10)">"#,
+            r#"<text x="30" y="10" textLength="6" font-size="1.69" text-anchor="middle" opacity="0">C2</text>"#,
+            r#"</g>"#,
+            r#"<path d="M 0 10 L 20 10"/>"#,
+        );
+        assert_eq!(svg_line_through_text(only_horizontal, &["C2"]), 0);
+        let vertical_lead = concat!(
+            r#"<g transform="rotate(90 30 10)">"#,
+            r#"<text x="30" y="10" textLength="6" font-size="1.69" text-anchor="middle" opacity="0">C2</text>"#,
+            r#"</g>"#,
+            r#"<path d="M 30 0 L 30 20"/>"#,
+        );
+        assert_eq!(svg_line_through_text(vertical_lead, &["C2"]), 1);
     }
 
     #[tokio::test]
