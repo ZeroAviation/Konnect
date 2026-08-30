@@ -1,6 +1,9 @@
 //! `verification` toolset — DRC, design rules, KiCAD UI management, routing utilities.
 //!
-//! DRC delegates to `kicad-cli`. Design rules are read/written as S-expressions.
+//! DRC delegates to `kicad-cli`. Board-level DRC minima live in the sibling
+//! `.kicad_pro` (`board.design_settings.rules`); layer constraints live in a
+//! `.kicad_dru`. KiCad 10 will not open a board whose `(setup)` contains
+//! `min_clearance` / `min_track_width` / `min_via_*` / `min_hole_to_hole`.
 //! KiCAD UI management uses process inspection + subprocess spawning.
 
 use crate::mcp::protocol::CallToolResult;
@@ -47,7 +50,11 @@ pub fn tools() -> Vec<ToolDef> {
         ),
         tool!(
             "set_design_rules",
-            "Set board-level design rules (clearance, trace width, via size) in the sibling KiCAD project file.",
+            "Set board-level DRC minima (clearance, track width, via size, hole-to-hole) in the sibling \
+             .kicad_pro under board.design_settings.rules — the only place KiCad 10 reads them. Never \
+             writes the board file: KiCad 10 rejects min_clearance / min_track_width / min_via_* / \
+             min_hole_to_hole inside (setup) and will not open the board. This is the constraint \
+             setter; add_design_rule (config toolset) stores a natural-language note, not a DRC value.",
             json!({
                 "type": "object",
                 "properties": {
@@ -409,6 +416,15 @@ async fn handle_set_design_rules(
 ) -> anyhow::Result<CallToolResult> {
     let board = get_path(args, "board")?;
     let project_path = sibling_project_path(&board);
+    if !project_path.exists() {
+        return Ok(CallToolResult::error(format!(
+            "No project file at {} — DRC minima live in the .kicad_pro under \
+             board.design_settings.rules. KiCad 10 rejects those tokens inside \
+             the board (setup) block and will not open the file. Create the \
+             project and retry.",
+            project_path.display()
+        )));
+    }
     let project_content = tokio::fs::read_to_string(&project_path).await?;
     let mut project: serde_json::Value = serde_json::from_str(&project_content)?;
 
@@ -1359,6 +1375,59 @@ mod tests {
         assert_eq!(rules["min_through_hole_diameter"], 0.30);
         assert_eq!(rules["min_via_diameter"], 0.70);
         assert_eq!(rules["min_hole_to_hole"], 0.45);
+        assert_eq!(
+            setup_constraint_tokens(&tokio::fs::read_to_string(&board).await.unwrap()),
+            Vec::<String>::new()
+        );
+    }
+
+    /// KiCad 10 refuses a board whose `(setup)` contains any of these. They
+    /// are design-rule constraints and belong in `.kicad_pro` or `.kicad_dru`.
+    const SETUP_CONSTRAINT_TOKENS: &[&str] = &[
+        "min_clearance",
+        "min_track_width",
+        "min_trace_width",
+        "min_via_drill",
+        "min_via_size",
+        "min_via_diameter",
+        "min_hole_to_hole",
+        "min_through_hole_diameter",
+    ];
+
+    fn setup_constraint_tokens(board: &str) -> Vec<String> {
+        let tree = konnect_sexp::parser::parse_sexp(board).expect("board parses");
+        let setup = tree.find("setup").expect("board has (setup)");
+        setup
+            .children()
+            .unwrap_or(&[])
+            .iter()
+            .filter_map(|n| n.head())
+            .filter(|head| SETUP_CONSTRAINT_TOKENS.contains(head))
+            .map(str::to_string)
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn set_design_rules_without_a_project_file_refuses_and_writes_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let board = dir.path().join("board.kicad_pcb");
+        tokio::fs::write(&board, blank_board()).await.unwrap();
+        let original_board = tokio::fs::read(&board).await.unwrap();
+
+        let result = handle_set_design_rules(
+            &json!({ "board": board, "min_clearance": 0.127 }),
+            &test_ctx(),
+        )
+        .await
+        .expect("missing project is a tool error, not an internal failure");
+        assert!(result.is_error, "{}", text_of(&result));
+        assert!(
+            text_of(&result).contains("kicad_pro"),
+            "{}",
+            text_of(&result)
+        );
+        assert_eq!(tokio::fs::read(&board).await.unwrap(), original_board);
+        assert!(!dir.path().join("board.kicad_pro").exists());
     }
 
     fn text_of(result: &CallToolResult) -> String {

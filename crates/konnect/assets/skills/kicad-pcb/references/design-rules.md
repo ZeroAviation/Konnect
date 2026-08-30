@@ -23,9 +23,13 @@ and every applicable requirement has a project rule or explicit review check.
 ## 2. Encode the accepted values
 
 Use `set_design_rules` for board-wide minima and `get_design_rules` to read back
-what was stored. Use `create_netclass` for electrical groups and
-`assign_net_to_class` for exact net membership. Use `set_predefined_sizes` for
-the accepted trace/via palette.
+what was stored. Those values land in the sibling `.kicad_pro` (the project's
+board design-settings rules object), not in the board file. KiCad 10 will not
+open a board that puts clearance, track-width, via, or hole-to-hole minima in
+the board setup block. `add_design_rule` (config toolset) is a natural-language
+note for the agent; it does not change DRC. Use `create_netclass` for electrical
+groups and `assign_net_to_class` for exact net membership. Use
+`set_predefined_sizes` for the accepted trace/via palette.
 
 The project netclasses are the source of truth for routing widths, clearances, and
 via geometry. Name classes by purpose—ordinary signal, current-carrying rail,

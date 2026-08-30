@@ -268,7 +268,9 @@ pub fn tools() -> Vec<ToolDef> {
         ),
         tool!(
             "add_design_rule",
-            "Add a natural-language design rule that Claude should follow in this project. \
+            "Append a natural-language design note that an agent should follow in this project \
+             (or user-wide). This is NOT a DRC constraint setter and does not change clearance, \
+             track width, or via minima — use set_design_rules (verification toolset) for those. \
              Examples: 'Always use 100nF X7R for MCU decoupling within 3mm of power pin', \
              'Route USB D+/D- as 90-ohm differential pair'.",
             json!({
