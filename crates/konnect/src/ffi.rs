@@ -36,16 +36,20 @@ pub unsafe extern "C" fn kicad_plugin_init(config_path: *const c_char) -> c_int 
 
     rt.spawn(async move {
         use crate::config::{Config, TransportMode};
+        use konnect_core::config_resolution::ConfigResolution;
         use konnect_core::mcp::handler::McpHandler;
 
         // KiCad loads this cdylib with KICAD_API_SOCKET set, so this path needs
         // the same ipc_address resolution the standalone server does.
-        let (config, ipc_source) =
+        // A failed load still falls back to defaults here, unchanged: that is a
+        // separate defect. Report its provenance as unavailable rather than
+        // fabricating a clean defaults selection.
+        let (config, ipc_source, config_resolution) =
             Config::load_resolved(config_path_str.as_deref().map(std::path::Path::new))
                 .unwrap_or_else(|_| {
                     let mut config = Config::default();
                     let ipc_source = config.resolve_ipc_address();
-                    (config, ipc_source)
+                    (config, ipc_source, ConfigResolution::unavailable())
                 });
         // `main.rs` installs a subscriber before reporting the resolution.
         // This entry point installed none, so the report — including the
@@ -68,7 +72,7 @@ pub unsafe extern "C" fn kicad_plugin_init(config_path: *const c_char) -> c_int 
             auto_load_toolsets: config.auto_load_toolsets,
             eager_toolsets: config.eager_toolsets,
         };
-        match McpHandler::new(server_config).await {
+        match McpHandler::new_with_config_resolution(server_config, config_resolution).await {
             Ok(handler) => match config.transport {
                 TransportMode::Stdio => {
                     let _ = crate::transport::stdio::run_stdio(handler).await;
