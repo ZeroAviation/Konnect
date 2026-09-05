@@ -1833,6 +1833,37 @@ pub fn tools() -> Vec<ToolDef> {
         )
         .with_board_access(crate::tools::BoardAccess::LivePreferredWithFallback),
         tool!(
+            "set_reference_texts",
+            "Atomically set placed footprint Reference-field geometry on a closed board through KiCad's native pcbnew Python API. Requires the exact current board SHA-256, refuses a board held open by KiCad, verifies a native no-op control against the candidate outside the requested complete Reference blocks, and atomically replaces the file only after full readback passes. Live Reference-field IPC is disabled because KiCad 10.0.5 crashed during UpdateItems.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "board": { "type": "string" },
+                    "expected_sha256": { "type": "string", "pattern": "^[0-9A-Fa-f]{64}$" },
+                    "placements": {
+                        "type": "array",
+                        "minItems": 1,
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "reference": { "type": "string", "minLength": 1 },
+                                "x": { "type": "number", "description": "Absolute board X in millimetres" },
+                                "y": { "type": "number", "description": "Absolute board Y in millimetres" },
+                                "rotation": { "type": "number", "description": "Absolute text rotation in degrees" },
+                                "size_x": { "type": "number", "exclusiveMinimum": 0 },
+                                "size_y": { "type": "number", "exclusiveMinimum": 0 },
+                                "stroke_width": { "type": "number", "exclusiveMinimum": 0 }
+                            },
+                            "required": ["reference", "x", "y", "rotation", "size_x", "size_y", "stroke_width"]
+                        }
+                    }
+                },
+                "required": ["board", "expected_sha256", "placements"]
+            }),
+            |args, ctx| async move { handle_set_reference_texts(args, ctx).await }
+        )
+        .with_board_access(crate::tools::BoardAccess::ClosedBoardOnly),
+        tool!(
             "flip_component",
             "Set a placed footprint to F.Cu or B.Cu with KiCAD-equivalent geometry mirroring. \
              This operation requires a closed board: it safely flips supported footprints with \
@@ -2459,6 +2490,139 @@ async fn handle_set_component_placements(
             }))),
             Err(error) => Ok(error.into_result()),
         },
+    }
+}
+
+fn parse_reference_text_placements(
+    args: &serde_json::Value,
+) -> Result<Vec<konnect_ipc::types::IpcReferenceTextPlacement>, CallToolResult> {
+    let values = require_array(args, "placements")?;
+    if values.is_empty() {
+        return Err(invalid_placement(
+            "placements".to_string(),
+            "must contain at least one placement",
+        ));
+    }
+
+    let mut references = HashSet::new();
+    let mut placements = Vec::with_capacity(values.len());
+    for (index, value) in values.iter().enumerate() {
+        let indexed = |name: &str| format!("placements[{index}].{name}");
+        let Some(object) = value.as_object() else {
+            return Err(invalid_placement(
+                format!("placements[{index}]"),
+                "must be an object",
+            ));
+        };
+        let reference = object
+            .get("reference")
+            .and_then(serde_json::Value::as_str)
+            .filter(|reference| !reference.trim().is_empty())
+            .ok_or_else(|| invalid_placement(indexed("reference"), "missing or empty"))?
+            .to_string();
+        if !references.insert(reference.clone()) {
+            return Err(invalid_placement(
+                indexed("reference"),
+                format!("duplicate footprint reference '{reference}'"),
+            ));
+        }
+
+        let number = |name: &str, positive: bool, nanometres: bool| {
+            let field = indexed(name);
+            let value = object
+                .get(name)
+                .and_then(serde_json::Value::as_f64)
+                .ok_or_else(|| invalid_placement(field.clone(), "missing or not a number"))?;
+            if !value.is_finite() {
+                return Err(invalid_placement(field, "must be finite"));
+            }
+            if positive && value <= 0.0 {
+                return Err(invalid_placement(field, "must be greater than zero"));
+            }
+            if nanometres {
+                let scaled = value * 1_000_000.0;
+                if !scaled.is_finite() || scaled < i64::MIN as f64 || scaled >= -(i64::MIN as f64) {
+                    return Err(invalid_placement(
+                        field,
+                        "cannot be represented in KiCad nanometres",
+                    ));
+                }
+                if positive && scaled as i64 == 0 {
+                    return Err(invalid_placement(
+                        field,
+                        "is positive but rounds below one KiCad nanometre",
+                    ));
+                }
+            }
+            Ok(value)
+        };
+
+        placements.push(konnect_ipc::types::IpcReferenceTextPlacement {
+            reference,
+            x: number("x", false, true)?,
+            y: number("y", false, true)?,
+            rotation: number("rotation", false, false)?,
+            size_x: number("size_x", true, true)?,
+            size_y: number("size_y", true, true)?,
+            stroke_width: number("stroke_width", true, true)?,
+        });
+    }
+    Ok(placements)
+}
+
+async fn handle_set_reference_texts(
+    args: &serde_json::Value,
+    ctx: &ToolContext,
+) -> anyhow::Result<CallToolResult> {
+    let board = get_path(args, "board")?;
+    let expected_sha256 = match require_str(args, "expected_sha256") {
+        Ok(value) => value.to_string(),
+        Err(error) => return Ok(error),
+    };
+    if let Err(error) =
+        crate::tools::reference_text_closed::validate_expected_sha256(&expected_sha256)
+    {
+        return Ok(invalid_placement(
+            "expected_sha256".to_string(),
+            error.to_string(),
+        ));
+    }
+    let placements = match parse_reference_text_placements(args) {
+        Ok(placements) => placements,
+        Err(error) => return Ok(error),
+    };
+    if let Some(refusal) = crate::tools::pcb_board::refuse_if_board_open_in_kicad(
+        ctx,
+        &board,
+        "native Reference-field update",
+    )
+    .await?
+    {
+        return Ok(refusal);
+    }
+    match crate::tools::reference_text_closed::apply_closed_reference_texts(
+        &board,
+        &expected_sha256,
+        &placements,
+        &ctx.config.kicad_cli,
+    )
+    .await
+    {
+        Ok(applied) => Ok(CallToolResult::json(&json!({
+            "count": applied.batch.requested_count,
+            "requested_count": applied.batch.requested_count,
+            "changed_count": applied.batch.changed_count,
+            "unchanged_count": applied.batch.unchanged_count,
+            "placements": applied.batch.placements,
+            "source": "closed_board_native_pcbnew",
+            "source_sha256": applied.source_sha256,
+            "result_sha256": applied.result_sha256,
+            "kicad_version": applied.kicad_version,
+            "semantic_guard": "candidate equals native no-op control outside requested complete Reference blocks"
+        }))),
+        Err(error) => Ok(CallToolResult::error(format!(
+            "Closed-board Reference update failed: {error:#}. Inspect the current board SHA-256 before retrying."
+        ))),
     }
 }
 
@@ -5647,6 +5811,69 @@ mod tests {
         url
     }
 
+    #[allow(dead_code)]
+    fn spawn_kicad_with_only_other_board_open() -> String {
+        use nng::options::Options;
+        use prost::Message;
+        let port = {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            listener.local_addr().unwrap().port()
+        };
+        let url = format!("tcp://127.0.0.1:{port}");
+        let socket = nng::Socket::new(nng::Protocol::Rep0).expect("mock rep socket");
+        socket
+            .set_opt::<nng::options::RecvTimeout>(Some(std::time::Duration::from_secs(10)))
+            .unwrap();
+        socket.listen(&url).expect("mock listen");
+        std::thread::spawn(move || {
+            while socket.recv().is_ok() {
+                let open = konnect_ipc::gen::kiapi::common::commands::GetOpenDocumentsResponse {
+                    documents: vec![konnect_ipc::gen::kiapi::common::types::DocumentSpecifier {
+                        r#type: konnect_ipc::gen::kiapi::common::types::DocumentType::DoctypePcb
+                            as i32,
+                        project: None,
+                        identifier: Some(
+                            konnect_ipc::gen::kiapi::common::types::document_specifier::Identifier::BoardFilename(
+                                "other.kicad_pcb".to_string(),
+                            ),
+                        ),
+                    }],
+                };
+                let response = konnect_ipc::gen::kiapi::common::ApiResponse {
+                    status: Some(konnect_ipc::gen::kiapi::common::ApiResponseStatus {
+                        status: konnect_ipc::gen::kiapi::common::ApiStatusCode::AsOk as i32,
+                        error_message: String::new(),
+                    }),
+                    header: None,
+                    message: Some(konnect_ipc::builders::pack_any(
+                        &open,
+                        "kiapi.common.commands.GetOpenDocumentsResponse",
+                    )),
+                };
+                let out = nng::Message::from(response.encode_to_vec().as_slice());
+                if socket.send(out).is_err() {
+                    break;
+                }
+            }
+        });
+        url
+    }
+
+    fn test_ctx_with_ipc(ipc_address: String) -> ToolContext {
+        ToolContext::new(
+            crate::tools::ServerConfig {
+                kicad_cli: String::new(),
+                kicad_binary: String::new(),
+                ipc_address,
+                project_dir: None,
+                jlcpcb_db_path: None,
+                auto_load_toolsets: false,
+                eager_toolsets: false,
+            },
+            std::sync::Arc::new(crate::router::ToolRouter::new()),
+        )
+    }
+
     #[tokio::test]
     async fn a_reachable_kicad_that_rejects_never_touches_the_file() {
         let tmp = tempfile::tempdir().unwrap();
@@ -6188,6 +6415,195 @@ mod tests {
             board_content,
             "board file must be left untouched"
         );
+    }
+
+    #[test]
+    fn set_reference_texts_schema_declares_the_closed_board_revision_guarded_contract() {
+        let definition = tools()
+            .into_iter()
+            .find(|tool| tool.name == "set_reference_texts")
+            .expect("set_reference_texts must be registered");
+        assert_eq!(
+            definition.board_access,
+            crate::tools::BoardAccess::ClosedBoardOnly
+        );
+        assert_eq!(
+            definition.input_schema["required"],
+            json!(["board", "expected_sha256", "placements"])
+        );
+        assert_eq!(
+            definition.input_schema["properties"]["expected_sha256"]["pattern"],
+            "^[0-9A-Fa-f]{64}$"
+        );
+        assert_eq!(
+            definition.input_schema["properties"]["placements"]["minItems"],
+            1
+        );
+        assert_eq!(
+            definition.input_schema["properties"]["placements"]["items"]["required"],
+            json!([
+                "reference",
+                "x",
+                "y",
+                "rotation",
+                "size_x",
+                "size_y",
+                "stroke_width"
+            ])
+        );
+    }
+
+    #[test]
+    fn reference_text_parser_accepts_a_complete_record() {
+        let parsed = parse_reference_text_placements(&json!({
+            "placements": [{
+                "reference": "R1",
+                "x": 101.25,
+                "y": 97.5,
+                "rotation": 90,
+                "size_x": 0.8,
+                "size_y": 0.8,
+                "stroke_width": 0.15
+            }]
+        }))
+        .expect("valid placement");
+        assert_eq!(parsed.len(), 1);
+        assert_eq!(parsed[0].reference, "R1");
+        assert_eq!(parsed[0].rotation, 90.0);
+    }
+
+    #[test]
+    fn reference_text_parser_rejects_invalid_records_before_ipc() {
+        let valid = json!({
+            "reference": "R1",
+            "x": 1.0,
+            "y": 2.0,
+            "rotation": 0.0,
+            "size_x": 0.8,
+            "size_y": 0.8,
+            "stroke_width": 0.15
+        });
+        let mut cases = vec![
+            (json!([]), "placements".to_string()),
+            (
+                json!([valid.clone(), valid.clone()]),
+                "placements[1].reference".to_string(),
+            ),
+        ];
+        for (field, value) in [
+            ("reference", json!("")),
+            ("x", serde_json::Value::Null),
+            ("x", json!(1.0e20)),
+            ("rotation", serde_json::Value::Null),
+            ("size_x", json!(0.0)),
+            ("size_y", json!(-1.0)),
+            ("stroke_width", json!(0.0000001)),
+        ] {
+            let mut record = valid.clone();
+            record[field] = value;
+            cases.push((json!([record]), format!("placements[0].{field}")));
+        }
+
+        for (placements, field) in cases {
+            let error = parse_reference_text_placements(&json!({ "placements": placements }))
+                .expect_err(&field);
+            let text = format!("{error:?}");
+            assert!(text.contains(&field), "{field}: {text}");
+            assert_eq!(
+                crate::mcp::error::extract_error_kind(&error).as_deref(),
+                Some("invalid_argument"),
+                "{field}: {text}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn set_reference_texts_refuses_a_stale_revision_without_editing_the_board_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        let board = tmp.path().join("b.kicad_pcb");
+        let original = "(kicad_pcb\n  (version 20250610)\n)\n";
+        std::fs::write(&board, original).unwrap();
+
+        let result = handle_set_reference_texts(
+            &json!({
+                "board": board.to_string_lossy(),
+                "expected_sha256": "0000000000000000000000000000000000000000000000000000000000000000",
+                "placements": [{
+                    "reference": "R1",
+                    "x": 1.0,
+                    "y": 2.0,
+                    "rotation": 0.0,
+                    "size_x": 0.8,
+                    "size_y": 0.8,
+                    "stroke_width": 0.15
+                }]
+            }),
+            &test_ctx(),
+        )
+        .await
+        .unwrap();
+
+        assert!(result.is_error);
+        assert_eq!(
+            crate::mcp::error::extract_error_kind(&result).as_deref(),
+            Some("handler_error")
+        );
+        assert_eq!(std::fs::read_to_string(board).unwrap(), original);
+    }
+
+    #[tokio::test]
+    async fn set_reference_texts_does_not_treat_a_rejected_probe_as_a_live_board() {
+        let tmp = tempfile::tempdir().unwrap();
+        let board = tmp.path().join("b.kicad_pcb");
+        let original = "(kicad_pcb\n  (version 20250610)\n)\n";
+        std::fs::write(&board, original).unwrap();
+        let ctx = test_ctx_with_ipc(spawn_rejecting_kicad());
+
+        let result = handle_set_reference_texts(
+            &json!({
+                "board": board.to_string_lossy(),
+                "expected_sha256": "0000000000000000000000000000000000000000000000000000000000000000",
+                "placements": [{
+                    "reference": "R1", "x": 1.0, "y": 2.0, "rotation": 0.0,
+                    "size_x": 0.8, "size_y": 0.8, "stroke_width": 0.15
+                }]
+            }),
+            &ctx,
+        )
+        .await
+        .unwrap();
+
+        assert!(result.is_error);
+        assert!(result_text(&result).contains("Closed-board Reference update failed"));
+        assert_eq!(std::fs::read_to_string(board).unwrap(), original);
+    }
+
+    #[tokio::test]
+    async fn set_reference_texts_refuses_when_the_requested_board_is_open() {
+        let tmp = tempfile::tempdir().unwrap();
+        let board = tmp.path().join("target.kicad_pcb");
+        let original = "(kicad_pcb\n  (version 20250610)\n)\n";
+        std::fs::write(&board, original).unwrap();
+        let ctx = test_ctx_with_ipc(spawn_kicad_holding(&board, vec![]));
+
+        let result = handle_set_reference_texts(
+            &json!({
+                "board": board.to_string_lossy(),
+                "expected_sha256": "0000000000000000000000000000000000000000000000000000000000000000",
+                "placements": [{
+                    "reference": "R1", "x": 1.0, "y": 2.0, "rotation": 0.0,
+                    "size_x": 0.8, "size_y": 0.8, "stroke_width": 0.15
+                }]
+            }),
+            &ctx,
+        )
+        .await
+        .unwrap();
+
+        assert!(result.is_error);
+        assert!(result_text(&result).contains("currently holds this board open"));
+        assert!(result_text(&result).contains("Close the board"));
+        assert_eq!(std::fs::read_to_string(board).unwrap(), original);
     }
 }
 

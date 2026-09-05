@@ -446,6 +446,29 @@ fn placement_batch_moves_and_rotates_multiple_footprints_in_one_update() {
     assert_eq!(pad_positions_mm(&sent[0]), vec![(50.0, 51.0), (50.0, 49.0)]);
 }
 
+#[test]
+fn live_reference_text_mutation_is_disabled_before_any_ipc_request() {
+    let (mock, captured) = spawn_footprint_mock(mk_footprint_r1());
+    let client = KiCadIpcClient::new(&mock.url);
+    let error = client
+        .set_reference_texts(
+            std::path::Path::new("test.kicad_pcb"),
+            &[konnect_ipc::types::IpcReferenceTextPlacement {
+                reference: "R1".into(),
+                x: 1.0,
+                y: 2.0,
+                rotation: 0.0,
+                size_x: 0.8,
+                size_y: 0.8,
+                stroke_width: 0.15,
+            }],
+        )
+        .unwrap_err();
+
+    assert!(error.to_string().contains("disabled"));
+    assert!(captured.lock().unwrap().is_none());
+}
+
 /// Absolute on the platform running the test — a POSIX-rooted path is not
 /// absolute on Windows, and only an absolute project directory can place the
 /// bare board filename KiCad sends.

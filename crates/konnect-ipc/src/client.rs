@@ -2166,6 +2166,24 @@ impl KiCadIpcClient {
             .collect()
     }
 
+    /// Refuse live Reference-field writes.
+    ///
+    /// KiCad 10.0.5 crashed when a parent-scoped `PCB_TEXT_T` compatibility
+    /// update targeted a live `PCB_FIELD_T`; the direct `PCB_FIELD_T` path had
+    /// previously returned success without changing anything. Reference text
+    /// placement is therefore implemented only for a closed board in
+    /// `konnect-core`. Keeping this refusal at the IPC client boundary prevents
+    /// another caller from accidentally reviving either unsafe path.
+    pub fn set_reference_texts(
+        &self,
+        _board: &Path,
+        _placements: &[IpcReferenceTextPlacement],
+    ) -> Result<IpcReferenceTextBatchResult> {
+        anyhow::bail!(
+            "live Reference-field mutation is disabled: KiCad 10.0.5 crashed during the parent-scoped BoardText compatibility update"
+        )
+    }
+
     /// Update the visible value field of an existing footprint.
     pub fn set_footprint_value(&self, reference: &str, value: &str) -> Result<()> {
         let items = self.get_items(kiapi::common::types::KiCadObjectType::KotPcbFootprint)?;
@@ -2629,7 +2647,14 @@ impl KiCadIpcClient {
         let cmd = kiapi::common::commands::RunAction {
             action: action.to_string(),
         };
-        self.send_command(&cmd, "kiapi.common.commands.RunAction")?;
+        let response = unpack_required::<kiapi::common::commands::RunActionResponse>(
+            self.send_command(&cmd, "kiapi.common.commands.RunAction")?,
+            "RunAction",
+        )?;
+        let status = response.status();
+        if status != kiapi::common::commands::RunActionStatus::RasOk {
+            anyhow::bail!("KiCad rejected action '{action}': {}", status.as_str_name());
+        }
         Ok(())
     }
 }

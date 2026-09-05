@@ -55,6 +55,31 @@ pub struct IpcFootprintPlacement {
     pub rotation: f64,
 }
 
+/// Absolute board-space geometry for one placed footprint's Reference field.
+///
+/// This deliberately carries only the six mutable geometry leaves. The
+/// closed-board native operation preserves the semantic reference string and
+/// every other field, footprint, pad, graphic, and model property.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct IpcReferenceTextPlacement {
+    pub reference: String,
+    pub x: f64,
+    pub y: f64,
+    pub rotation: f64,
+    pub size_x: f64,
+    pub size_y: f64,
+    pub stroke_width: f64,
+}
+
+/// Verified outcome of one atomic Reference-field placement batch.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct IpcReferenceTextBatchResult {
+    pub requested_count: usize,
+    pub changed_count: usize,
+    pub unchanged_count: usize,
+    pub placements: Vec<IpcReferenceTextPlacement>,
+}
+
 #[derive(Debug, Clone)]
 pub struct IpcPadDefinition {
     pub number: String,

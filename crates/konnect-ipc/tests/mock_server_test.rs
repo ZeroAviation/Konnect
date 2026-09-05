@@ -104,6 +104,60 @@ fn open_board_response() -> kiapi::common::ApiResponse {
 }
 
 #[test]
+fn run_action_checks_the_inner_run_action_status() {
+    for (status, expected) in [
+        (
+            kiapi::common::commands::RunActionStatus::RasInvalid,
+            "RAS_INVALID",
+        ),
+        (
+            kiapi::common::commands::RunActionStatus::RasFrameNotOpen,
+            "RAS_FRAME_NOT_OPEN",
+        ),
+    ] {
+        let mock = spawn_mock(move |request| {
+            let message = request.message.expect("request must pack a command");
+            assert!(message.type_url.ends_with("RunAction"));
+            let command = kiapi::common::commands::RunAction::decode(message.value.as_slice())
+                .expect("decode RunAction");
+            assert_eq!(command.action, "common.Interactive.undo");
+            Some(reply_with(builders::pack_any(
+                &kiapi::common::commands::RunActionResponse {
+                    status: status as i32,
+                },
+                "kiapi.common.commands.RunActionResponse",
+            )))
+        });
+
+        let error = KiCadIpcClient::new(&mock.url)
+            .run_action("common.Interactive.undo")
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains(expected), "{error}");
+    }
+}
+
+#[test]
+fn run_action_accepts_only_explicit_ok_status() {
+    let mock = spawn_mock(|request| {
+        let message = request.message.expect("request must pack a command");
+        let command = kiapi::common::commands::RunAction::decode(message.value.as_slice())
+            .expect("decode RunAction");
+        assert_eq!(command.action, "common.Interactive.undo");
+        Some(reply_with(builders::pack_any(
+            &kiapi::common::commands::RunActionResponse {
+                status: kiapi::common::commands::RunActionStatus::RasOk as i32,
+            },
+            "kiapi.common.commands.RunActionResponse",
+        )))
+    });
+
+    KiCadIpcClient::new(&mock.url)
+        .run_action("common.Interactive.undo")
+        .unwrap();
+}
+
+#[test]
 fn save_document_to_string_targets_the_named_open_board() {
     let mock = spawn_mock(|request| {
         let message = request.message.expect("request must pack a command");
