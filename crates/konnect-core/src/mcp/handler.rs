@@ -30,6 +30,24 @@ pub struct McpHandler {
     observer: CallObserver,
 }
 
+/// MCP clients known to cache the first `tools/list` and ignore
+/// `notifications/tools/list_changed`. For these, any toolset loaded after the
+/// handshake is permanently uncallable (#134, #169, #459), so the whole
+/// catalogue is loaded before the first listing instead.
+///
+/// Names are matched case-insensitively as prefixes of `clientInfo.name`.
+/// `claude-ai` is what Claude Desktop sends, read from its own MCP log
+/// (`%APPDATA%/Claude/logs`) rather than assumed. Add a client here only with
+/// the same kind of evidence.
+const CLIENTS_THAT_CACHE_TOOL_LIST: &[&str] = &["claude-ai"];
+
+pub(crate) fn client_caches_tool_list(client_name: &str) -> bool {
+    let name = client_name.trim().to_ascii_lowercase();
+    CLIENTS_THAT_CACHE_TOOL_LIST
+        .iter()
+        .any(|known| name.starts_with(known))
+}
+
 impl McpHandler {
     pub async fn new(config: crate::tools::ServerConfig) -> anyhow::Result<Self> {
         Self::new_with_config_resolution(
@@ -132,10 +150,38 @@ impl McpHandler {
         }
     }
 
+    /// At `initialize`, look at who is on the other end. A client that caches
+    /// its first tool list gets the full catalogue loaded now, before the
+    /// `tools/list` that follows the handshake, because for it there is no
+    /// later. Every other client keeps the starter kit and the on-demand
+    /// loader.
+    ///
+    /// `eager_toolsets = true` still loads everything at startup for any
+    /// client; this only adds the automatic case. Loading is idempotent, so a
+    /// client that is both configured eager and detected here loads once.
+    async fn adapt_to_client(&self, params: Option<&Value>) {
+        let name = params
+            .and_then(|p| p.get("clientInfo"))
+            .and_then(|c| c.get("name"))
+            .and_then(|n| n.as_str())
+            .unwrap_or("");
+        tracing::info!(
+            "MCP client: {}",
+            if name.is_empty() { "(unnamed)" } else { name }
+        );
+        if client_caches_tool_list(name) {
+            tracing::info!(
+                "client caches its tool list; loading every toolset before the first tools/list"
+            );
+            self.ctx.router.load_all().await;
+        }
+    }
+
     async fn dispatch(&self, req: &JsonRpcRequest) -> anyhow::Result<Option<Value>> {
         match req.method.as_str() {
             // ── Lifecycle ──────────────────────────────────────────────────
             "initialize" => {
+                self.adapt_to_client(req.params.as_ref()).await;
                 let result = McpServerState::build_initialize_result();
                 Ok(Some(serde_json::to_value(result)?))
             }
@@ -870,5 +916,121 @@ mod first_missing_required_tests {
             None
         );
         assert_eq!(first_missing_required(&schema(json!([])), &json!({})), None);
+    }
+}
+
+/// Claude Desktop caches the first `tools/list` and never re-fetches it, so
+/// out of the box it could call 20 of 217 tools (#459). The handshake now
+/// tells us who is asking, and a known caching client gets the whole
+/// catalogue before its first listing.
+#[cfg(test)]
+mod client_adaptation_tests {
+    use super::*;
+    use crate::tools::ServerConfig;
+
+    async fn lazy_handler() -> McpHandler {
+        McpHandler::new(ServerConfig {
+            kicad_cli: String::new(),
+            kicad_binary: String::new(),
+            ipc_address: String::new(),
+            project_dir: None,
+            jlcpcb_db_path: None,
+            auto_load_toolsets: false,
+            eager_toolsets: false,
+        })
+        .await
+        .expect("handler builds")
+    }
+
+    fn request(method: &str, params: Value) -> JsonRpcRequest {
+        JsonRpcRequest {
+            jsonrpc: "2.0".to_string(),
+            id: Some(json!(1)),
+            method: method.to_string(),
+            params: Some(params),
+        }
+    }
+
+    async fn listed_tool_count(handler: &McpHandler) -> usize {
+        let out = handler
+            .dispatch(&request("tools/list", json!({})))
+            .await
+            .expect("tools/list dispatches")
+            .expect("tools/list returns a result");
+        out["tools"].as_array().expect("tools array").len()
+    }
+
+    fn initialize_from(client: &str) -> Value {
+        json!({
+            "protocolVersion": "2025-06-18",
+            "capabilities": {},
+            "clientInfo": {"name": client, "version": "0.1.0"}
+        })
+    }
+
+    fn full_catalogue() -> usize {
+        crate::router::registry::ALL_TOOLSETS
+            .iter()
+            .map(|t| t.tool_count)
+            .sum::<usize>()
+            + meta_tools::meta_tool_descriptions().len()
+    }
+
+    /// The exact string Claude Desktop sends, read from its own log.
+    #[tokio::test]
+    async fn claude_desktop_gets_the_full_catalogue_before_its_first_listing() {
+        let handler = lazy_handler().await;
+        let starter = listed_tool_count(&handler).await;
+        handler
+            .dispatch(&request("initialize", initialize_from("claude-ai")))
+            .await
+            .expect("initialize dispatches");
+        let after = listed_tool_count(&handler).await;
+        assert!(
+            after > starter,
+            "initialize must have loaded more than the starter kit: {starter} -> {after}"
+        );
+        assert_eq!(
+            after,
+            full_catalogue(),
+            "a caching client must see the whole catalogue in its first listing"
+        );
+    }
+
+    /// A client that honours list_changed keeps the cheap starter kit; the
+    /// context economy is the point of the router and must survive this.
+    #[tokio::test]
+    async fn other_clients_keep_the_starter_kit() {
+        let handler = lazy_handler().await;
+        let starter = listed_tool_count(&handler).await;
+        handler
+            .dispatch(&request("initialize", initialize_from("some-other-client")))
+            .await
+            .expect("initialize dispatches");
+        assert_eq!(listed_tool_count(&handler).await, starter);
+    }
+
+    /// No clientInfo at all is neither an error nor a reason to load.
+    #[tokio::test]
+    async fn a_missing_client_name_is_tolerated() {
+        let handler = lazy_handler().await;
+        let starter = listed_tool_count(&handler).await;
+        handler
+            .dispatch(&request("initialize", json!({})))
+            .await
+            .expect("initialize dispatches");
+        assert_eq!(listed_tool_count(&handler).await, starter);
+    }
+
+    /// Claude Code honours list_changed and must not be swept up by a loose
+    /// "claude" match: the cost is ~23K tokens on every listing.
+    #[test]
+    fn matching_is_case_insensitive_prefix_and_does_not_catch_claude_code() {
+        assert!(client_caches_tool_list("claude-ai"));
+        assert!(client_caches_tool_list("Claude-AI"));
+        assert!(client_caches_tool_list("claude-ai-desktop"));
+        assert!(!client_caches_tool_list("claude-code"));
+        assert!(!client_caches_tool_list("Claude Code"));
+        assert!(!client_caches_tool_list(""));
     }
 }
