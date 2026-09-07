@@ -7,7 +7,7 @@
 use crate::mcp::protocol::CallToolResult;
 use crate::tool;
 use crate::tools::library::{footprint_lib_nickname_for_dir, is_lib_id, resolve_footprint_path};
-use crate::tools::pcb_board::{attempt_ipc_write, BoardWrite, FILE_FALLBACK_WARNING};
+use crate::tools::pcb_board::{attempt_ipc_write, BoardWrite};
 use crate::tools::{
     get_path, require_array, require_f64, require_str, require_u64, with_board_ipc_classified,
     ToolContext, ToolDef,
@@ -2175,7 +2175,7 @@ async fn handle_place_component(
             "source": "ipc"
         }))),
         BoardWrite::Refused(result) => Ok(result),
-        BoardWrite::File(_) => {
+        BoardWrite::File(reason) => {
             // No live KiCad on the other end of this transport: fall back to
             // editing the board file directly.
             if board_contains_reference(&board, &reference)? {
@@ -2207,7 +2207,8 @@ async fn handle_place_component(
                 "footprint": footprint,
                 "x": x, "y": y, "rotation": rotation, "layer": layer,
                 "source": "file",
-                "warning": FILE_FALLBACK_WARNING
+                "fallback_reason": reason.evidence(),
+                "warning": reason.warning()
             })))
         }
     }
@@ -2241,7 +2242,7 @@ async fn handle_move_component(
             &json!({ "moved": reference, "x": x, "y": y, "source": "ipc" }),
         )),
         BoardWrite::Refused(result) => Ok(result),
-        BoardWrite::File(_) => {
+        BoardWrite::File(reason) => {
             match update_closed_board_footprint(
                 &board,
                 &reference,
@@ -2252,7 +2253,8 @@ async fn handle_move_component(
                     "x": x,
                     "y": y,
                     "source": "file",
-                    "warning": FILE_FALLBACK_WARNING
+                    "fallback_reason": reason.evidence(),
+                    "warning": reason.warning()
                 }))),
                 Err(error) => Ok(error.into_result()),
             }
@@ -2345,7 +2347,7 @@ async fn handle_rotate_component(
             "source": "ipc"
         }))),
         BoardWrite::Refused(result) => Ok(result),
-        BoardWrite::File(_) => {
+        BoardWrite::File(reason) => {
             match update_closed_board_footprint(
                 &board,
                 &reference,
@@ -2355,7 +2357,8 @@ async fn handle_rotate_component(
                     "rotated": reference,
                     "rotation": rotation,
                     "source": "file",
-                    "warning": FILE_FALLBACK_WARNING
+                    "fallback_reason": reason.evidence(),
+                    "warning": reason.warning()
                 }))),
                 Err(error) => Ok(error.into_result()),
             }
@@ -2446,12 +2449,13 @@ async fn handle_set_component_placements(
             "undo": "One KiCad undo step reverses the whole placement batch."
         }))),
         BoardWrite::Refused(result) => Ok(result),
-        BoardWrite::File(_) => match update_closed_board_footprints(&board, &placements) {
+        BoardWrite::File(reason) => match update_closed_board_footprints(&board, &placements) {
             Ok(applied) => Ok(CallToolResult::json(&json!({
                 "count": applied.len(),
                 "placements": applied,
                 "source": "file",
-                "warning": FILE_FALLBACK_WARNING
+                "fallback_reason": reason.evidence(),
+                "warning": reason.warning()
             }))),
             Err(error) => Ok(error.into_result()),
         },
