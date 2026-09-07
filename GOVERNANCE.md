@@ -73,6 +73,41 @@ Maintainers apply these queue rules:
 These rules protect review quality without requiring every related change to be
 one large PR. The unit of review remains one focused outcome.
 
+### Admission control
+
+The constraint is not how much work exists, it is how much *unfinished* work
+sits in the review queue at once. Unreviewed inventory is what goes stale.
+
+- One overlapping review-ready PR per contributor.
+- One next-to-merge PR per dependency chain.
+- In a high-conflict subsystem, at most one *ready to merge* plus two
+  *waiting on review* behind it.
+- Work that overlaps an admitted PR waits for its base-forming predecessor.
+- A large item is split into independently valid increments **before** it is
+  claimed. "Large" is a signal to split the acceptance criteria, not
+  permission to open a cumulative branch.
+
+Develop ahead as much as you like. What does not work is several cumulative
+PRs sitting in the active queue, each invalidated whenever `main` moves.
+
+### Landing order
+
+Within an overlap set the order is not arbitrary:
+
+1. Prerequisites and invariant-defining PRs first.
+2. Independent, non-overlapping work may pass a blocked stack.
+3. Within an overlap set, choose one base-forming PR.
+4. Reconstruct only the *immediate* successor once its prerequisite lands —
+   not every descendant.
+5. Shared generated files land before their consumers. Tool counts are no
+   longer in this category: `cargo xtask fix-doc-counts` derives them, so a
+   consumer regenerates rather than conflicts.
+6. **Release, version and count changes land last** — never through the middle
+   of an active queue. v0.10.0 ignored this and invalidated eleven open PRs in
+   one push. This rule exists because of that, not in anticipation of it.
+7. After each merge: update `main`, run the full gate, promote the next PR,
+   and arm auto-merge only once the exact head has been reviewed.
+
 ## Releases
 
 - **Never hand-edit tool counts.** `cargo xtask fix-doc-counts` rewrites them

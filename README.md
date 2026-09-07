@@ -353,6 +353,9 @@ works only when passed with `--config`.)
 
 ## Support
 
+- Community Discord: [join the Konnect community](https://discord.gg/NVp9RGMmDu)
+  for installation help, AI-client setup, design-workflow discussion,
+  contributor coordination, and live project-status updates
 - Issues & feature requests: [GitHub Issues](https://github.com/mixelpixx/Konnect/issues)
 - Roadmap: [ROADMAP.md](ROADMAP.md)
 - Contributing: [CONTRIBUTING.md](CONTRIBUTING.md)

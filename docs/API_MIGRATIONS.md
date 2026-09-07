@@ -3,6 +3,25 @@
 Konnect's tool schemas are public API. This file records intentional argument
 removals and the supported replacement workflow.
 
+## Unreleased: `score_placement` reports interface filter caps (minor release)
+
+`score_placement`'s decoupling deduction no longer fires on a capacitor placed on
+a connector's own pins for cable/EMI filtering (#411). A cap beyond its value
+family's limit from the nearest shared-net IC is exempted only when a `J*`
+connector carries **every** net that cap carries and its courtyard edge is within
+that same limit of the cap's center. The cap must be on the connector's face,
+unless the connector's pads carrying those nets reach both copper faces — a
+plated through-hole pin, not an SMD one.
+
+Results add `interface_filter_caps`: one entry per exempted cap, with
+`reference`, `value`, `connector`, `connector_distance_mm`, and `limit_mm`. It is
+evidence rather than a score — an exempted cap deducts nothing, and a waiver that
+vanished silently would be indistinguishable from a check that never ran. The
+array is empty on boards without such caps.
+
+No tool, argument, or existing response field was renamed or removed. This
+additive response field is planned for the next minor release.
+
 ## Unreleased: type-safe trace deletion (minor release)
 
 `delete_trace` now accepts only a UUID observed in the requested live board's
@@ -15,6 +34,40 @@ observed segment rather than echoed from the request. Results add
 `deleted_type: "trace_segment"`, the observed net/layer/width/endpoints under
 `preimage`, and `postcondition: "absent_from_trace_readback"`. No argument or
 tool was renamed or removed.
+
+## Unreleased: committed schematic component mutation readback (minor release)
+
+Schematic component placement, batch placement, field edits and renames, moves,
+rotations, annotations, and grouping now bind the selected symbol UUIDs before
+writing and build their success responses from one reload of the committed
+schematic. Existing response fields remain. Results add observed identity and
+placement evidence including `schematic`, `reference`, `uuid`, `lib_id`,
+`unit_count`, `units`, `fields`, coordinates, rotation, and instance paths or
+references where applicable. Grouping returns the same evidence per component.
+
+Success additionally requires every bound unit's observed unit number, library
+ID, project/hierarchy paths, x/y, rotation, and property values to match the
+preselected target plus the intended mutation. Placement compares requested
+Reference/Value, library and unit, and its tool's coordinate rules (component
+placement snaps to 1.27 mm; power placement retains requested coordinates).
+Edits preserve the other bound values; moves preserve relative unit positions,
+and rotations preserve relative unit angles. Coordinate/angle comparisons allow
+only serialization rounding below 0.000001 mm/degrees.
+
+Missing, malformed, stale-revision, or wrong-document identities refuse with
+`stale_target`, including mismatched intended values. Component-target
+resolution and committed readback reject duplicate UUID, reference/unit,
+property, or instance identities and conflicting project, instance-unit,
+or cross-unit hierarchy records
+with the new `ambiguous_target` kind and include their candidates whenever
+Konnect cannot prove one top-level symbol per bound UUID and one logical
+reference across its units. A
+post-write verification refusal can follow a committed write, so inspect and
+reload the saved schematic before retrying. A move commits the symbol placement
+before a separate junction-reconciliation write; if that second write or final
+readback refuses, the move can already be durable. This additive response
+change is planned for the next minor release; no tool or argument was renamed
+or removed.
 
 ## Unreleased: connectivity-safe component deletion (minor release)
 
@@ -33,9 +86,10 @@ each reference's observed unit count and UUIDs), `deleted_item_uuids`, and the
 same connectivity evidence fields. These values come from reloading the
 committed schematic rather than echoing requested selectors.
 
-Missing, protected, duplicate, malformed, stale, wrong-document, or
-editor-locked targets refuse with the existing `stale_target` kind before a
-write when Konnect cannot prove a unique safe deletion. A post-write readback
+Missing, protected, malformed, stale, wrong-document, or editor-locked targets
+refuse with `stale_target` before a write. Duplicate UUID or reference/unit
+identities refuse with `ambiguous_target` when Konnect cannot prove a unique
+safe deletion. A post-write readback
 that still observes a selected reference or UUID also returns `stale_target`;
 inspect and reload the saved schematic before retrying because that refusal can
 follow a committed write. This additive response change is planned for the next
