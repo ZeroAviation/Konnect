@@ -132,11 +132,38 @@ The house rule, and the reason most of this file exists:
 
 - **A response field must be derived from the result, never echoed from the
   request.** Most defects in this project's history are that one mistake.
-- **A check that could not run is `BLOCKED`, never a silent pass.**
+- **A check that could not run is `BLOCKED`, never a silent pass.** That status
+  describes the evidence item; it does not automatically decide whether the
+  whole pull request is blocked.
 - **Fixtures come from real KiCad output.** A hand-authored fixture tends to
   share the assumption the code got wrong, so it agrees with the bug.
 - **Neuter every new guard** and confirm the test catches it. A passing test
   proves nothing until you have watched it fail.
+
+### Risk-proportionate validation
+
+Required hosted CI, deterministic regression tests, and evidence for material
+safety properties remain hard merge gates. Environment-dependent observations
+are shared project work:
+
+- A contributor supplies real-environment evidence from an affected environment
+  they reasonably have access to. They are not expected to personally own every
+  supported operating system, KiCad version, or hardware configuration.
+- Hosted CI owns supported-platform regression coverage. Maintainers recruit the
+  original reporter or community testers when their environment can resolve a
+  remaining uncertainty more directly.
+- An unavailable secondary-environment observation may become explicit
+  validation debt when the change is focused and reversible, required CI is
+  green, deterministic coverage is adequate, and the unobserved path is not a
+  credible data-loss, security, or compatibility hazard. Name the untested
+  environment in the issue completion record or release checklist.
+- Missing evidence blocks the pull request when it is necessary to establish
+  the change's core behavior or a material safety property and no adequate test
+  or proxy exists. State that specific risk instead of requiring every platform
+  by default.
+
+Validation debt is permission to gather field evidence after a safe merge, not
+permission to represent an unavailable check as passed or to bypass required CI.
 
 ## Licensing
 
