@@ -135,11 +135,51 @@ impl DrcReport {
 
 // ─── KiCAD CLI Runner ─────────────────────────────────────────────────────────
 
+/// Turn the configured `kicad_cli` value into something `Command::new` can
+/// actually start.
+///
+/// The default configuration is the bare filename, and KiCad 10's installer
+/// does not put `kicad-cli` on PATH, so on a stock Windows install every
+/// kicad-cli-backed tool failed until the user hand-edited the config (#460).
+/// #344 taught `kicad_install` where KiCad lives, but only the library
+/// resolver asked it; this spawn path kept passing the raw string through,
+/// which is why the failure reproduced on a build that already had #344.
+///
+/// Three cases, and they are deliberately not one:
+///
+/// - **Empty** means "no kicad-cli". It stays empty so the spawn fails with
+///   the familiar error. Sixty-odd test fixtures rely on that sentinel, and a
+///   user who blanks the value has said something, not nothing.
+/// - **A bare name** (the default) is discovered: PATH first, then the known
+///   install locations, via `kicad_install::find_cli`. This is the #460 fix.
+/// - **An explicit path** is the user's decision and passes through untouched.
+///   If it does not exist the spawn fails on *that* path, so a typo is
+///   reported rather than quietly replaced by a different KiCad — running a
+///   binary the user did not name and reporting its results as theirs is the
+///   request-versus-result defect this project keeps finding elsewhere.
+pub(crate) fn resolve_cli_executable(configured: &str) -> std::path::PathBuf {
+    let configured = configured.trim();
+    let path = std::path::PathBuf::from(configured);
+    if configured.is_empty() || path.components().count() > 1 {
+        return path;
+    }
+    match crate::kicad_install::find_cli(configured) {
+        Some(found) => {
+            if found.as_os_str() != configured {
+                info!("kicad-cli resolved to {}", found.display());
+            }
+            found
+        }
+        None => path,
+    }
+}
+
 /// Run a kicad-cli command with arguments and capture stdout.
 async fn run_cli(cli: &str, args: &[&str], timeout_dur: Duration) -> Result<String> {
     info!("[BETA] kicad-cli {} {}", cli, args.join(" "));
 
-    let mut cmd = Command::new(cli);
+    let exe = resolve_cli_executable(cli);
+    let mut cmd = Command::new(&exe);
     cmd.args(args).stdout(Stdio::piped()).stderr(Stdio::piped());
 
     let child = cmd
@@ -1886,6 +1926,82 @@ mod bom_export_tests {
                 "/out/bom.csv",
                 "/s.kicad_sch"
             ]
+        );
+    }
+}
+
+#[cfg(test)]
+mod cli_discovery_tests {
+    use super::resolve_cli_executable;
+    use std::path::PathBuf;
+
+    /// Empty is the "no kicad-cli" sentinel and must survive resolution:
+    /// discovering a real binary here would turn every fixture that says
+    /// "unavailable" into one that runs DRC for real on a developer machine.
+    #[test]
+    fn empty_stays_empty() {
+        assert_eq!(resolve_cli_executable(""), PathBuf::from(""));
+        assert_eq!(resolve_cli_executable("   "), PathBuf::from(""));
+    }
+
+    /// An explicit path to an existing file is used as-is.
+    #[test]
+    fn an_explicit_existing_path_is_returned_unchanged() {
+        let me = std::env::current_exe().expect("test binary path");
+        let configured = me.to_string_lossy().to_string();
+        assert_eq!(resolve_cli_executable(&configured), me);
+    }
+
+    /// An explicit path that does not exist is the user's mistake to see, not
+    /// ours to paper over with whatever KiCad happens to be installed.
+    #[test]
+    fn an_explicit_missing_path_is_not_replaced_by_a_discovered_install() {
+        let missing = if cfg!(windows) {
+            "C:/definitely/not/here/kicad-cli.exe"
+        } else {
+            "/definitely/not/here/kicad-cli"
+        };
+        assert_eq!(resolve_cli_executable(missing), PathBuf::from(missing));
+    }
+
+    /// A bare name that resolves to nothing falls through to whatever KiCad is
+    /// discoverable, and only with no KiCad anywhere comes back untouched. The
+    /// result is never a phantom: it is the input or a file that exists.
+    #[test]
+    fn a_bare_unresolvable_name_is_the_input_or_a_real_discovered_file() {
+        let bogus = "definitely-not-a-real-kicad-cli-binary-4f2a.exe";
+        let resolved = resolve_cli_executable(bogus);
+        assert!(
+            resolved.as_os_str() == bogus || resolved.is_file(),
+            "resolved to a path that neither is the input nor exists: {}",
+            resolved.display()
+        );
+    }
+
+    /// The case #460 is about: the bare default name on a machine where KiCad
+    /// is installed but not on PATH. Skips silently where KiCad is absent, so
+    /// CI on a runner without KiCad does not fail for the wrong reason.
+    #[test]
+    fn the_bare_default_name_resolves_to_an_installed_kicad_cli() {
+        let bare = if cfg!(windows) {
+            "kicad-cli.exe"
+        } else {
+            "kicad-cli"
+        };
+        let resolved = resolve_cli_executable(bare);
+        if resolved.as_os_str() == bare {
+            eprintln!("SKIP: no KiCad installation discoverable on this machine");
+            return;
+        }
+        assert!(
+            resolved.is_absolute(),
+            "resolved to a relative path: {}",
+            resolved.display()
+        );
+        assert!(
+            resolved.is_file(),
+            "resolved path is not a file: {}",
+            resolved.display()
         );
     }
 }
