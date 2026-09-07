@@ -86,26 +86,35 @@ pub enum IpcAddressSource {
 impl IpcAddressSource {
     /// Report the resolution once tracing is initialized.
     pub fn log(self, address: &str) {
+        if let Some(message) = self.resolved_log_message(address) {
+            info!("{message}");
+            return;
+        }
+
+        warn!(
+            "No KiCad IPC socket found (no KICAD_API_SOCKET, none detected at {}). \
+             Live-KiCad tools will fail and file-backed ones will edit the \
+             project on disk instead. Enable Edit > Preferences > Plugins > \
+             'Enable KiCad API' in KiCad, or set ipc_address in your config.",
+            konnect_ipc::candidate_socket_paths()
+                .iter()
+                .map(|path| path.display().to_string())
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+    }
+
+    fn resolved_log_message(self, address: &str) -> Option<String> {
         let source = match self {
             IpcAddressSource::Config => "config",
             IpcAddressSource::Environment => "KICAD_API_SOCKET",
             IpcAddressSource::Detected => "auto-detection",
-            IpcAddressSource::Unresolved => {
-                warn!(
-                    "No KiCad IPC socket found (no KICAD_API_SOCKET, none detected at {}). \
-                     Live-KiCad tools will fail and file-backed ones will edit the \
-                     project on disk instead. Enable Edit > Preferences > Plugins > \
-                     'Enable KiCad API' in KiCad, or set ipc_address in your config.",
-                    konnect_ipc::candidate_socket_paths()
-                        .iter()
-                        .map(|path| path.display().to_string())
-                        .collect::<Vec<_>>()
-                        .join(", ")
-                );
-                return;
-            }
+            IpcAddressSource::Unresolved => return None,
         };
-        info!("KiCad IPC address from {source}: {address}");
+        Some(format!(
+            "KiCad IPC address from {source}: {}",
+            konnect_core::redact_ipc_endpoint(address)
+        ))
     }
 }
 
@@ -194,8 +203,9 @@ impl Config {
             return IpcAddressSource::Config;
         }
         if let Ok(sock) = std::env::var("KICAD_API_SOCKET") {
+            let sock = sock.trim();
             if !sock.is_empty() {
-                self.ipc_address = sock;
+                self.ipc_address = sock.to_string();
                 return IpcAddressSource::Environment;
             }
         }
@@ -386,6 +396,34 @@ mod tests {
         assert_eq!(c.resolve_ipc_address(), IpcAddressSource::Environment);
         assert_eq!(c.ipc_address, "ipc://env-fallback.sock");
         std::env::remove_var("KICAD_API_SOCKET");
+    }
+
+    #[test]
+    fn blank_env_value_falls_back_to_detection() {
+        let _guard = ENV_GUARD.lock().unwrap();
+        std::env::set_var("KICAD_API_SOCKET", " \t ");
+
+        let mut c = Config::default();
+        let source = c.resolve_ipc_address_with(|| Some("ipc:///tmp/kicad/api.sock".to_string()));
+
+        assert_eq!(source, IpcAddressSource::Detected);
+        assert_eq!(c.ipc_address, "ipc:///tmp/kicad/api.sock");
+        std::env::remove_var("KICAD_API_SOCKET");
+    }
+
+    #[test]
+    fn resolved_log_message_redacts_endpoint_secrets() {
+        let message = IpcAddressSource::Environment
+            .resolved_log_message("tcp://user:secret@127.0.0.1:9000?token=hidden#detail")
+            .unwrap();
+
+        assert_eq!(
+            message,
+            "KiCad IPC address from KICAD_API_SOCKET: \
+             tcp://[redacted]@127.0.0.1:9000 [query/fragment redacted]"
+        );
+        assert!(!message.contains("secret"));
+        assert!(!message.contains("hidden"));
     }
 
     #[test]

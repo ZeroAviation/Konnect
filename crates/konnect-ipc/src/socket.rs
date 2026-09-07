@@ -228,6 +228,20 @@ mod tests {
         );
     }
 
+    #[test]
+    #[cfg(unix)]
+    fn an_owned_regular_file_is_not_detected() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("not-a-socket");
+        std::fs::write(&path, b"regular file").unwrap();
+
+        assert!(is_owned_by_us(&path), "sanity: this process owns the file");
+        assert!(
+            !is_listening(&path),
+            "an owned regular file must not be adopted as an IPC socket"
+        );
+    }
+
     /// The bound the probe promises, over the case it exists for.
     ///
     /// A blocking `connect()` on an `AF_UNIX` stream whose backlog is full
@@ -320,12 +334,15 @@ mod tests {
     }
 
     #[test]
-    fn a_platform_that_cannot_probe_detects_nothing() {
-        // What Windows does: a named pipe cannot be probed, so nothing is
-        // detected and the "not configured" guidance stays in place rather
-        // than being replaced by a dial failure against an unchosen address.
-        let candidates = vec![PathBuf::from(r"C:\Temp\kicad\api.sock")];
-        assert!(detect_ipc_address_in(&candidates, |_| false).is_none());
+    #[cfg(not(unix))]
+    fn windows_production_probe_detects_nothing() {
+        // Exercise the production non-Unix probe rather than a supplied test
+        // closure. NNG maps ipc:// to a named pipe on Windows, and this PR does
+        // not guess that mapping.
+        assert!(candidate_socket_paths()
+            .iter()
+            .all(|path| !is_listening(path)));
+        assert!(detect_ipc_address().is_none());
     }
 
     #[test]
