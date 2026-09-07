@@ -72,6 +72,15 @@ The description should state:
 6. tests run, including intentionally skipped environment-dependent checks;
 7. risk and rollback notes for file formats, IPC, packaging, or release changes.
 
+You do not need personal access to every supported operating system, KiCad
+version, or hardware configuration. For an environment-dependent check you
+cannot run, name the missing environment, provide the deterministic and hosted
+CI evidence you can, and identify any original reporter or community tester who
+may be able to validate it. Maintainers apply the risk-proportionate validation
+rule in [GOVERNANCE.md](GOVERNANCE.md); an unavailable secondary observation is
+not automatically a blocked pull request, but required CI and material safety
+evidence remain mandatory.
+
 Treat MCP tools, schema fields, CLI flags, environment variables, config keys, and
 documented paths as public API. Preserve compatibility or provide an explicit
 migration. Keep generated artifacts, personal settings, downloaded catalogs, build
