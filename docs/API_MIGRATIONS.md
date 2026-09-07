@@ -3,6 +3,22 @@
 Konnect's tool schemas are public API. This file records intentional argument
 removals and the supported replacement workflow.
 
+## Unreleased: guarded PCB file fallback reports its observed reason
+
+Hybrid PCB mutation tools may use their existing direct-file fallback when
+KiCad IPC is unreachable or when a reachable KiCad positively reports that the
+requested board is not open. A successful file-path result now includes
+`fallback_reason.kind` (`transport_unreachable` or `board_not_open`) and
+`fallback_reason.message`; its warning is derived from that same observation.
+Existing `source: "file"` and operation-specific fields remain unchanged.
+
+If KiCad answers but any relevant open PCB document identity is empty, bare,
+malformed, unresolved, duplicated, or otherwise prevents a complete comparison,
+the tool fails closed with structured error kind `ambiguous_open_board` and the
+requested `path`. No IPC mutation or file mutation is attempted. Callers should
+make KiCad's open documents identifiable, then retry; they must not treat this
+error as permission to edit the saved file directly.
+
 ## Unreleased: `score_placement` reports interface filter caps (minor release)
 
 `score_placement`'s decoupling deduction no longer fires on a capacitor placed on
