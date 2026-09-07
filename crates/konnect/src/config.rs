@@ -113,7 +113,7 @@ impl IpcAddressSource {
         };
         Some(format!(
             "KiCad IPC address from {source}: {}",
-            konnect_core::redact_ipc_endpoint(address)
+            konnect_ipc::redact_endpoint(address)
         ))
     }
 }

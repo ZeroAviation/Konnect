@@ -437,7 +437,7 @@ impl KiCadIpcClient {
             "[BETA] IPC → {} ({} bytes) to {}",
             type_name,
             request_bytes.len(),
-            self.socket_path
+            crate::redact_endpoint(&self.socket_path)
         );
 
         // Connect via NNG req0 socket
@@ -467,9 +467,10 @@ impl KiCadIpcClient {
             format!("ipc://{}", self.socket_path)
         };
 
+        let diagnostic_dial_url = crate::redact_endpoint(&dial_url);
         socket.dial(&dial_url).map_err(|error| {
             anyhow::Error::new(TransportUnreachable).context(format!(
-                "Cannot connect to KiCad IPC at {dial_url}: {error}. KiCad may be \
+                "Cannot connect to KiCad IPC at {diagnostic_dial_url}: {error}. KiCad may be \
                  closed, its API disabled (Edit > Preferences > Plugins > \
                  'Enable KiCad API'), or this address left behind by a closed \
                  session (guide: \
@@ -525,9 +526,9 @@ impl KiCadIpcClient {
                 warn!(
                     "[BETA] Ping to {} failed: {}",
                     if self.socket_path.is_empty() {
-                        "<unconfigured socket>"
+                        "<unconfigured socket>".to_string()
                     } else {
-                        &self.socket_path
+                        crate::redact_endpoint(&self.socket_path)
                     },
                     e
                 );
@@ -2676,6 +2677,28 @@ fn paths_refer_to_same_board(requested: &Path, active: &Path) -> bool {
             requested.components().count() == 1 && requested.file_name() == active.file_name()
         }
         _ => requested == active,
+    }
+}
+
+#[cfg(test)]
+mod diagnostic_tests {
+    use super::*;
+
+    #[test]
+    fn dial_failure_does_not_expose_endpoint_secrets() {
+        let endpoint = "tcp://user:secret@127.0.0.1:1?token=hidden#detail";
+        let client = KiCadIpcClient::new(endpoint);
+        let error = client
+            .send_command(
+                &kiapi::common::commands::Ping {},
+                "kiapi.common.commands.Ping",
+            )
+            .expect_err("the deliberately unusable endpoint must not answer");
+        let diagnostic = format!("{error:#}");
+
+        assert!(diagnostic.contains("[redacted]"), "{diagnostic}");
+        assert!(!diagnostic.contains("secret"), "{diagnostic}");
+        assert!(!diagnostic.contains("hidden"), "{diagnostic}");
     }
 }
 

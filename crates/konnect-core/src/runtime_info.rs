@@ -37,7 +37,7 @@ pub(crate) async fn collect(config: &ServerConfig) -> Value {
     let ipc_endpoint = if config.ipc_address.trim().is_empty() {
         None
     } else {
-        Some(redact_ipc_endpoint(config.ipc_address.trim()))
+        Some(konnect_ipc::redact_endpoint(config.ipc_address.trim()))
     };
 
     json!({
@@ -239,33 +239,6 @@ fn stable_version_cmp(candidate: &str, running: &str) -> Option<Ordering> {
     Some(stable_triplet(candidate)?.cmp(&stable_triplet(running)?))
 }
 
-/// Remove credentials, query values, and fragments before an IPC endpoint is
-/// reported in diagnostics.
-pub fn redact_ipc_endpoint(endpoint: &str) -> String {
-    let (without_fragment, had_fragment) = endpoint
-        .split_once('#')
-        .map_or((endpoint, false), |(head, _)| (head, true));
-    let (without_query, had_query) = without_fragment
-        .split_once('?')
-        .map_or((without_fragment, false), |(head, _)| (head, true));
-
-    let without_credentials = if let Some((scheme, rest)) = without_query.split_once("://") {
-        if let Some((_, authority_and_path)) = rest.split_once('@') {
-            format!("{scheme}://[redacted]@{authority_and_path}")
-        } else {
-            without_query.to_string()
-        }
-    } else {
-        without_query.to_string()
-    };
-
-    if had_query || had_fragment {
-        format!("{without_credentials} [query/fragment redacted]")
-    } else {
-        without_credentials
-    }
-}
-
 fn restart_guidance(source: &str, newer_than_running: Option<bool>) -> Vec<String> {
     let mut guidance = Vec::new();
     if newer_than_running == Some(true) {
@@ -346,18 +319,6 @@ mod tests {
         let source = classify_installation(&executable);
         assert_eq!(source.name, "kicad_pcm");
         assert_eq!(source.manifest_path, Some(plugin_dir.join("plugin.json")));
-    }
-
-    #[test]
-    fn endpoint_redaction_removes_credentials_query_and_fragment() {
-        assert_eq!(
-            redact_ipc_endpoint("tcp://user:secret@127.0.0.1:9000/api?token=hidden#detail"),
-            "tcp://[redacted]@127.0.0.1:9000/api [query/fragment redacted]"
-        );
-        assert_eq!(
-            redact_ipc_endpoint("ipc:///tmp/kicad/api.sock"),
-            "ipc:///tmp/kicad/api.sock"
-        );
     }
 
     #[test]

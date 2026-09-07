@@ -7,7 +7,6 @@ pub(crate) mod native_specctra_bridge;
 pub mod observability;
 pub mod router;
 pub(crate) mod runtime_info;
-pub use runtime_info::redact_ipc_endpoint;
 pub(crate) mod specctra;
 pub(crate) mod specctra_ses;
 pub mod tools;

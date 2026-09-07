@@ -385,14 +385,15 @@ fn warn_if_ipc_unreachable(address: &str, error: &anyhow::Error) {
     if !konnect_ipc::is_transport_unreachable(error) {
         return;
     }
+    let diagnostic_address = if address.is_empty() {
+        "<unset>".to_string()
+    } else {
+        konnect_ipc::redact_endpoint(address)
+    };
     tracing::warn!(
-        ipc_address = if address.is_empty() {
-            "<unset>"
-        } else {
-            address
-        },
-        // Formatted inside the macro so a filtered-out WARN costs nothing.
-        "KiCad IPC unreachable, so the live board was not consulted: {error:#}"
+        ipc_address = %diagnostic_address,
+        error = %error.root_cause(),
+        "KiCad IPC unreachable, so the live board was not consulted"
     );
 }
 
