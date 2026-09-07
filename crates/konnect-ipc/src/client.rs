@@ -309,6 +309,17 @@ impl std::fmt::Display for TransportUnreachable {
 
 impl std::error::Error for TransportUnreachable {}
 
+/// Whether `error` came from a request that never reached KiCad.
+///
+/// The borrowing form of [`IpcFailure::from_error`], for callers that only
+/// need the classification (logging a fallback) and must leave the error
+/// intact. Like `from_error`, it walks the chain — never the message text.
+pub fn is_transport_unreachable(error: &anyhow::Error) -> bool {
+    error
+        .chain()
+        .any(|cause| cause.is::<TransportUnreachable>())
+}
+
 /// Why an IPC operation failed, for callers deciding whether a file-based
 /// fallback is safe.
 ///
@@ -333,10 +344,7 @@ impl IpcFailure {
     /// message text.
     pub fn from_error(error: anyhow::Error) -> Self {
         let message = format!("{error:#}");
-        if error
-            .chain()
-            .any(|cause| cause.is::<TransportUnreachable>())
-        {
+        if is_transport_unreachable(&error) {
             IpcFailure::Unreachable(message)
         } else {
             IpcFailure::Rejected(message)
@@ -365,6 +373,12 @@ pub struct KiCadIpcClient {
 impl KiCadIpcClient {
     /// Create a client connecting to the given IPC socket path.
     /// If empty, tries KICAD_API_SOCKET environment variable.
+    ///
+    /// This is the last-resort fallback for embedders that construct a client
+    /// directly. Konnect's server resolves the address once at startup — config
+    /// file, then the env var, then [`crate::socket::detect_ipc_address`] — and
+    /// hands the result in, so an empty path here means that resolution already
+    /// came up empty.
     pub fn new(socket_path: impl Into<String>) -> Self {
         let path = socket_path.into();
         let effective_path = if path.is_empty() {
@@ -423,7 +437,7 @@ impl KiCadIpcClient {
             "[BETA] IPC → {} ({} bytes) to {}",
             type_name,
             request_bytes.len(),
-            self.socket_path
+            crate::redact_endpoint(&self.socket_path)
         );
 
         // Connect via NNG req0 socket
@@ -453,9 +467,14 @@ impl KiCadIpcClient {
             format!("ipc://{}", self.socket_path)
         };
 
+        let diagnostic_dial_url = crate::redact_endpoint(&dial_url);
         socket.dial(&dial_url).map_err(|error| {
             anyhow::Error::new(TransportUnreachable).context(format!(
-                "Cannot connect to KiCAD IPC at {dial_url}: {error}"
+                "Cannot connect to KiCad IPC at {diagnostic_dial_url}: {error}. KiCad may be \
+                 closed, its API disabled (Edit > Preferences > Plugins > \
+                 'Enable KiCad API'), or this address left behind by a closed \
+                 session (guide: \
+                 https://github.com/mixelpixx/Konnect/blob/main/docs/TROUBLESHOOTING.md)"
             ))
         })?;
 
@@ -501,7 +520,18 @@ impl KiCadIpcClient {
         match self.send_command(&ping, "kiapi.common.commands.Ping") {
             Ok(_) => Ok(true),
             Err(e) => {
-                warn!("[BETA] Ping failed: {}", e);
+                // The address, because this is the one IPC failure that never
+                // reaches a caller as an error: `check_kicad_ui` reports the
+                // `false` and nothing else records which endpoint went unheard.
+                warn!(
+                    "[BETA] Ping to {} failed: {}",
+                    if self.socket_path.is_empty() {
+                        "<unconfigured socket>".to_string()
+                    } else {
+                        crate::redact_endpoint(&self.socket_path)
+                    },
+                    e
+                );
                 Ok(false)
             }
         }
@@ -2647,6 +2677,28 @@ fn paths_refer_to_same_board(requested: &Path, active: &Path) -> bool {
             requested.components().count() == 1 && requested.file_name() == active.file_name()
         }
         _ => requested == active,
+    }
+}
+
+#[cfg(test)]
+mod diagnostic_tests {
+    use super::*;
+
+    #[test]
+    fn dial_failure_does_not_expose_endpoint_secrets() {
+        let endpoint = "tcp://user:secret@127.0.0.1:1?token=hidden#detail";
+        let client = KiCadIpcClient::new(endpoint);
+        let error = client
+            .send_command(
+                &kiapi::common::commands::Ping {},
+                "kiapi.common.commands.Ping",
+            )
+            .expect_err("the deliberately unusable endpoint must not answer");
+        let diagnostic = format!("{error:#}");
+
+        assert!(diagnostic.contains("[redacted]"), "{diagnostic}");
+        assert!(!diagnostic.contains("secret"), "{diagnostic}");
+        assert!(!diagnostic.contains("hidden"), "{diagnostic}");
     }
 }
 
